@@ -30,6 +30,44 @@ func det(i int) *rand.Rand {
 	return rand.New(rand.NewSource(int64(uint64(i)*2654435761 + 1)))
 }
 
+// Geo layout: persistent persons are placed in NumGeoClusters well-separated
+// clusters (by index % NumGeoClusters) with sub-kilometer jitter. A near/within
+// query tight around one anchor returns exactly that cluster (a hit); a query
+// over GeoEmptyPoint returns zero (an expected miss). Coordinates are [lon,lat].
+const NumGeoClusters = 4
+
+// GeoAnchors are the cluster centers, thousands of km apart so a tight radius
+// never catches a neighboring cluster.
+var GeoAnchors = [NumGeoClusters][2]float64{
+	{-122.40, 37.77}, // San Francisco
+	{-74.00, 40.71},  // New York
+	{2.35, 48.85},    // Paris
+	{139.69, 35.68},  // Tokyo
+}
+
+// GeoEmptyPoint sits in the open Atlantic, far from every anchor.
+var GeoEmptyPoint = [2]float64{-30.0, 0.0}
+
+// GeoNearRadiusM is a radius that covers a cluster's jitter (~1.5 km) yet
+// excludes all other clusters (>5000 km away).
+const GeoNearRadiusM = 5000
+
+// GeoClusterCount returns the exact number of persistent persons in cluster c.
+func (d Dataset) GeoClusterCount(c int) int {
+	n := 0
+	for i := c; i < d.NumPersons; i += NumGeoClusters {
+		n++
+	}
+	return n
+}
+
+// geoPoint formats a GeoJSON Point for the given anchor with deterministic jitter.
+func geoPoint(idx int, r *rand.Rand) string {
+	a := GeoAnchors[idx%NumGeoClusters]
+	jitter := func() float64 { return (r.Float64()*2 - 1) * 0.01 } // ±~1 km
+	return fmt.Sprintf(`{"type":"Point","coordinates":[%g,%g]}`, a[0]+jitter(), a[1]+jitter())
+}
+
 // Dataset describes the fixed sizes of the test corpus. Same Dataset => same
 // logical graph.
 type Dataset struct {
@@ -87,6 +125,7 @@ type Person struct {
 	Active     bool
 	Bio        string
 	Tags       []string
+	Location   string // GeoJSON Point; empty for ephemeral
 	CreatedAt  string
 	CompanyXid string   // empty for ephemeral (edge-isolated)
 	FriendXids []string // empty for ephemeral
@@ -104,6 +143,7 @@ func (d Dataset) Person(i int) Person {
 		Active:     r.Intn(2) == 0,
 		Bio:        bios[r.Intn(len(bios))],
 		Tags:       pickTags(r),
+		Location:   geoPoint(i, r),
 		CreatedAt:  baseTime.Add(time.Duration(i) * time.Hour).Format(time.RFC3339),
 		CompanyXid: fmt.Sprintf("company-%d", i%d.NumCompanies),
 	}

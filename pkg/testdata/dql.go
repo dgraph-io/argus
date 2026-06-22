@@ -65,6 +65,9 @@ func (b *upsertBuilder) addPerson(p Person) {
 	for _, t := range p.Tags {
 		b.str(v, "tags_csv", t)
 	}
+	if p.Location != "" {
+		b.geo(v, "location", p.Location)
+	}
 	b.dateTime(v, "created_at", p.CreatedAt)
 	if p.CompanyXid != "" {
 		c := ref(b.varFor(p.CompanyXid))
@@ -200,6 +203,11 @@ func (b *upsertBuilder) boolVal(subj, pred string, v bool) {
 
 func (b *upsertBuilder) dateTime(subj, pred, iso string) {
 	fmt.Fprintf(&b.set, "%s <%s> \"%s\"^^<xs:dateTime> .\n", subj, pred, iso)
+	b.edges++
+}
+
+func (b *upsertBuilder) geo(subj, pred, geojson string) {
+	fmt.Fprintf(&b.set, "%s <%s> \"%s\"^^<geo:geojson> .\n", subj, pred, escapeRDF(geojson))
 	b.edges++
 }
 

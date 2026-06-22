@@ -63,6 +63,9 @@ func (c *Checker) CheckAll(ctx context.Context) *Result {
 	// DQL spot-check: person-0 values and edges.
 	c.checkPersonSpot(ctx, add)
 
+	// Geo: exact hits around cluster anchors and an expected miss.
+	c.checkGeo(ctx, add)
+
 	// GraphQL exact counts.
 	c.checkGQLCount(ctx, add, "aggregateProduct", c.data.NumProducts)
 	c.checkGQLCount(ctx, add, "aggregateCategory", c.data.NumCategories)
@@ -154,8 +157,12 @@ func (c *Checker) query(ctx context.Context, q string) ([]byte, error) {
 }
 
 func (c *Checker) dqlCount(ctx context.Context, typ string) (int, error) {
-	q := fmt.Sprintf(`{ q(func: type(%s)) { c: count(uid) } }`, typ)
-	data, err := c.query(ctx, q)
+	return c.countQuery(ctx, fmt.Sprintf(`{ q(func: type(%s)) { c: count(uid) } }`, typ))
+}
+
+// countQuery runs a DQL query whose root block `q` projects `c: count(uid)`.
+func (c *Checker) countQuery(ctx context.Context, query string) (int, error) {
+	data, err := c.query(ctx, query)
 	if err != nil {
 		return 0, err
 	}
@@ -171,6 +178,39 @@ func (c *Checker) dqlCount(ctx context.Context, typ string) (int, error) {
 		return 0, nil
 	}
 	return out.Q[0].C, nil
+}
+
+// checkGeo asserts exact geo results: a near() and within() hit return their
+// cluster's exact count, and a near() over empty ocean returns zero.
+func (c *Checker) checkGeo(ctx context.Context, add func(string, bool, string)) {
+	geoCount := func(name, query string, want int) {
+		got, err := c.countQuery(ctx, query)
+		if err != nil {
+			add(name, false, err.Error())
+			return
+		}
+		add(name, got == want, fmt.Sprintf("want %d got %d", want, got))
+	}
+
+	// Hit: tight radius around cluster 0's anchor returns exactly that cluster.
+	sf := testdata.GeoAnchors[0]
+	geoCount("geo-near-hit",
+		fmt.Sprintf(`{ q(func: near(location, [%g, %g], %d)) { c: count(uid) } }`, sf[0], sf[1], testdata.GeoNearRadiusM),
+		c.data.GeoClusterCount(0))
+
+	// Expected miss: open ocean, far from every cluster.
+	e := testdata.GeoEmptyPoint
+	geoCount("geo-near-miss",
+		fmt.Sprintf(`{ q(func: near(location, [%g, %g], %d)) { c: count(uid) } }`, e[0], e[1], testdata.GeoNearRadiusM),
+		0)
+
+	// Hit: a ±0.1° box around cluster 1's anchor returns exactly that cluster.
+	a := testdata.GeoAnchors[1]
+	poly := fmt.Sprintf("[[[%g,%g],[%g,%g],[%g,%g],[%g,%g],[%g,%g]]]",
+		a[0]-0.1, a[1]-0.1, a[0]+0.1, a[1]-0.1, a[0]+0.1, a[1]+0.1, a[0]-0.1, a[1]+0.1, a[0]-0.1, a[1]-0.1)
+	geoCount("geo-within-hit",
+		fmt.Sprintf(`{ q(func: within(location, %s)) { c: count(uid) } }`, poly),
+		c.data.GeoClusterCount(1))
 }
 
 func (c *Checker) dqlExists(ctx context.Context, xid string) (bool, error) {

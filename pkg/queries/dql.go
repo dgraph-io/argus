@@ -93,6 +93,21 @@ func DQLQueries() []DQLQuery {
 			Query: `{ q(func: type(Person)) @groupby(company) { count(uid) } }`,
 		},
 		{
+			// Geo hit: tight radius around the San Francisco cluster anchor.
+			Label: "geo-near-hit",
+			Query: `{ q(func: near(location, [-122.40, 37.77], 5000)) { uid name } }`,
+		},
+		{
+			// Geo expected-miss: open Atlantic, far from every cluster.
+			Label: "geo-near-miss",
+			Query: `{ q(func: near(location, [-30.0, 0.0], 5000)) { uid name } }`,
+		},
+		{
+			// Geo hit: bounding box around the New York cluster anchor.
+			Label: "geo-within-hit",
+			Query: `{ q(func: within(location, [[[-74.1, 40.61], [-73.9, 40.61], [-73.9, 40.81], [-74.1, 40.81], [-74.1, 40.61]]])) { uid name } }`,
+		},
+		{
 			Label: "vars-eq-lookup",
 			Query: `query q($a: int) { q(func: eq(age, $a), first: 25) { uid name age } }`,
 			Vars:  map[string]string{"$a": "30"},
