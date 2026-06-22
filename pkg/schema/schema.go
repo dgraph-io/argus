@@ -25,6 +25,7 @@ type Person {
   bio
   tags_csv
   location
+  embedding
   created_at
   friends
   company
@@ -35,6 +36,7 @@ type Company {
   name
   domain
   founded
+  territory
   employees
 }
 
@@ -66,14 +68,16 @@ email: string @index(hash, trigram) @upsert .
 age: int @index(int) .
 score: float @index(float) .
 active: bool @index(bool) .
-bio: string @index(fulltext, trigram) .
+bio: string @index(fulltext, trigram, ngram) .
 tags_csv: [string] @index(exact) .
 location: geo @index(geo) .
+embedding: float32vector @index(hnsw(metric: "euclidean")) .
 created_at: datetime @index(hour) .
 friends: [uid] @reverse @count .
 company: uid @reverse .
 domain: string @index(exact) .
 founded: datetime .
+territory: geo @index(geo) .
 employees: [uid] @reverse .
 title: string @index(fulltext, term) .
 content: string @index(fulltext) .

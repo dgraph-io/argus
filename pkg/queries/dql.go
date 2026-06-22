@@ -199,5 +199,20 @@ func DQLQueries() []DQLQuery {
 			Label: "geo-intersects-hit",
 			Query: `{ q(func: intersects(location, [[[-122.5, 37.70], [-122.3, 37.70], [-122.3, 37.85], [-122.5, 37.85], [-122.5, 37.70]]])) { uid name } }`,
 		},
+		{
+			// Vector similarity (HNSW): 10 nearest neighbors to a fixed query vector.
+			Label: "similar-to-vector",
+			Query: `{ q(func: similar_to(embedding, 10, "[0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]")) { uid } }`,
+		},
+		{
+			// N-gram substring search over bio.
+			Label: "ngram-bio",
+			Query: `{ q(func: ngram(bio, "engineer"), first: 50) { uid bio } }`,
+		},
+		{
+			// Geo contains: company-0's territory polygon contains its center point.
+			Label: "geo-contains-territory",
+			Query: `{ q(func: contains(territory, [-100.0, 10.0])) { uid name } }`,
+		},
 	}
 }

@@ -2,6 +2,7 @@ package testdata
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/dgraph-io/dgo/v250/protos/api"
@@ -68,6 +69,9 @@ func (b *upsertBuilder) addPerson(p Person) {
 	if p.Location != "" {
 		b.geo(v, "location", p.Location)
 	}
+	if len(p.Embedding) > 0 {
+		b.vector(v, "embedding", p.Embedding)
+	}
 	b.dateTime(v, "created_at", p.CreatedAt)
 	if p.CompanyXid != "" {
 		c := ref(b.varFor(p.CompanyXid))
@@ -90,6 +94,9 @@ func (b *upsertBuilder) addCompany(c Company) {
 	b.str(v, "name", c.Name)
 	b.str(v, "domain", c.Domain)
 	b.dateTime(v, "founded", c.Founded)
+	if c.Territory != "" {
+		b.geo(v, "territory", c.Territory)
+	}
 }
 
 func (b *upsertBuilder) addPost(p Post) {
@@ -209,6 +216,22 @@ func (b *upsertBuilder) dateTime(subj, pred, iso string) {
 func (b *upsertBuilder) geo(subj, pred, geojson string) {
 	fmt.Fprintf(&b.set, "%s <%s> \"%s\"^^<geo:geojson> .\n", subj, pred, escapeRDF(geojson))
 	b.edges++
+}
+
+func (b *upsertBuilder) vector(subj, pred string, v []float32) {
+	fmt.Fprintf(&b.set, "%s <%s> %q .\n", subj, pred, FormatVector(v))
+	b.edges++
+}
+
+// FormatVector renders a vector as Dgraph's "[v0, v1, ...]" literal (without
+// surrounding quotes), the form accepted both in RDF values and as the
+// similar_to query argument.
+func FormatVector(v []float32) string {
+	parts := make([]string, len(v))
+	for i, f := range v {
+		parts[i] = strconv.FormatFloat(float64(f), 'g', -1, 32)
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
 }
 
 func escapeRDF(s string) string {

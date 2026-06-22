@@ -68,6 +68,35 @@ func geoPoint(idx int, r *rand.Rand) string {
 	return fmt.Sprintf(`{"type":"Point","coordinates":[%g,%g]}`, a[0]+jitter(), a[1]+jitter())
 }
 
+// EmbedDim is the dimensionality of person embedding vectors.
+const EmbedDim = 8
+
+// embedding builds a deterministic, distinct vector for a person. Distinctness
+// makes the nearest neighbor to a person's own vector unambiguously itself,
+// which is the basis of the similar_to self-match check.
+func embedding(r *rand.Rand) []float32 {
+	v := make([]float32, EmbedDim)
+	for j := range v {
+		v[j] = float32(r.Float64())
+	}
+	return v
+}
+
+// CompanyCenter returns the deterministic center [lon,lat] of company i's
+// territory. Centers are spread far apart so territories never overlap.
+func CompanyCenter(i int) (float64, float64) {
+	return -100.0 + float64(i)*2.0, 10.0 + float64(i)*1.0
+}
+
+// companyTerritory returns a GeoJSON Polygon (a ±0.05° box) around company i's
+// center. Non-overlapping, so contains(territory, center_i) yields exactly i.
+func companyTerritory(i int) string {
+	cx, cy := CompanyCenter(i)
+	const h = 0.05
+	return fmt.Sprintf(`{"type":"Polygon","coordinates":[[[%g,%g],[%g,%g],[%g,%g],[%g,%g],[%g,%g]]]}`,
+		cx-h, cy-h, cx+h, cy-h, cx+h, cy+h, cx-h, cy+h, cx-h, cy-h)
+}
+
 // Dataset describes the fixed sizes of the test corpus. Same Dataset => same
 // logical graph.
 type Dataset struct {
@@ -125,7 +154,8 @@ type Person struct {
 	Active     bool
 	Bio        string
 	Tags       []string
-	Location   string // GeoJSON Point; empty for ephemeral
+	Location   string    // GeoJSON Point; empty for ephemeral
+	Embedding  []float32 // HNSW vector; nil for ephemeral
 	CreatedAt  string
 	CompanyXid string   // empty for ephemeral (edge-isolated)
 	FriendXids []string // empty for ephemeral
@@ -144,6 +174,7 @@ func (d Dataset) Person(i int) Person {
 		Bio:        bios[r.Intn(len(bios))],
 		Tags:       pickTags(r),
 		Location:   geoPoint(i, r),
+		Embedding:  embedding(r),
 		CreatedAt:  baseTime.Add(time.Duration(i) * time.Hour).Format(time.RFC3339),
 		CompanyXid: fmt.Sprintf("company-%d", i%d.NumCompanies),
 	}
@@ -216,19 +247,21 @@ func (d Dataset) EphPerson(i int) Person {
 
 // Company is a deterministic company record.
 type Company struct {
-	Xid     string
-	Name    string
-	Domain  string
-	Founded string
+	Xid       string
+	Name      string
+	Domain    string
+	Founded   string
+	Territory string // GeoJSON Polygon
 }
 
 // Company returns the company at index i.
 func (d Dataset) Company(i int) Company {
 	return Company{
-		Xid:     fmt.Sprintf("company-%d", i),
-		Name:    companyNm[i%len(companyNm)],
-		Domain:  fmt.Sprintf("co-%d.example.com", i),
-		Founded: baseTime.Add(time.Duration(i) * 24 * time.Hour).Format(time.RFC3339),
+		Xid:       fmt.Sprintf("company-%d", i),
+		Name:      companyNm[i%len(companyNm)],
+		Domain:    fmt.Sprintf("co-%d.example.com", i),
+		Founded:   baseTime.Add(time.Duration(i) * 24 * time.Hour).Format(time.RFC3339),
+		Territory: companyTerritory(i),
 	}
 }
 

@@ -24,6 +24,9 @@ func nodeFromPerson(p testdata.Person) personNode {
 		_ = json.Unmarshal([]byte(p.Location), &gp)
 		n.Location = &gp
 	}
+	for _, f := range p.Embedding {
+		n.Embedding = append(n.Embedding, float64(f))
+	}
 	return n
 }
 
@@ -55,6 +58,8 @@ func TestPersonDiffDetectsCorruption(t *testing.T) {
 		{"company-missing", func(n *personNode) { n.Company = nil }},
 		{"friends", func(n *personNode) { n.Friends = []xidRef{{Xid: "person-999"}} }},
 		{"location", func(n *personNode) { n.Location.Coordinates[0] += 1.0 }},
+		{"embedding", func(n *personNode) { n.Embedding[0] += 1.0 }},
+		{"embedding-len", func(n *personNode) { n.Embedding = n.Embedding[:len(n.Embedding)-1] }},
 		{"created_at", func(n *personNode) { n.CreatedAt = "2021-01-01T00:00:00Z" }},
 	}
 	for _, mc := range mutate {
