@@ -136,6 +136,7 @@ func (o *Orchestrator) logValidation(r *validate.Result) {
 	for _, c := range r.Checks {
 		if c.Passed {
 			passed++
+			slog.Info("validation check passed", "check", c.Name, "detail", c.Detail)
 		} else {
 			slog.Error("validation check failed", "check", c.Name, "detail", c.Detail)
 		}

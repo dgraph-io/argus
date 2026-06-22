@@ -7,6 +7,7 @@ Argus exercises Dgraph for correctness while benchmarking write and query perfor
 - **Concurrent read/write load.** Writers and readers run at the same time over the whole budget, mixing DQL and GraphQL.
 - **Single + bulk write mix.** DQL persons and posts are split 50/50 by record: half go through single-record upserts, half through bulk upsert transactions of ~120 edges each. Both paths are idempotent and carry distinct CSV labels (`person` vs `person-bulk`) so their throughput and latency are directly comparable.
 - **Deterministic end state.** The corpus is a fixed, enumerable dataset keyed by stable external ids (DQL `xid`; GraphQL `@id`). All writes are idempotent upserts, so any order or repetition converges to the same logical graph. A serial finalize pass pins the end state.
+- **Complete verification.** Because the dataset is enumerable, validation reads back every persistent node and compares it field-by-field to the generator — no spot-checking — and asserts the node set matches exactly.
 - **Deletions.** A deterministic ~5% "ephemeral" subset in each domain is created and deleted as churn; the finalize pass removes it, so the final graph is the persistent set only.
 - **Rich feature coverage.** DQL queries span filters, aggregation, ordering, pagination, recursion, reverse edges, full-text and regexp search, math, geo (`near`/`within`), `shortest` path, and variable blocks. GraphQL covers filters, enums, ordering, aggregation, nested traversal, and `@id` lookups.
 - **Shortest path over a deep subgraph.** The friends graph is a `+1` ring with a `+7` shortcut, giving a connected subgraph with a diameter of roughly N/7. A BFS over that deterministic rule predicts the exact shortest-path length, which is asserted against Dgraph's `shortest` (e.g. ~24 hops across the small dataset).
@@ -50,7 +51,7 @@ go build -o bin/argus ./cmd/argus
 1. **Setup** — apply the DQL schema (`Alter`) and the GraphQL schema (`updateGQLSchema`).
 2. **Mixed workload** — readers loop the query catalog while writers apply the dataset in idempotent upsert passes, repeating until the deadline. Snapshots flush every interval. A write pass always runs to completion, so the run may slightly exceed the target duration: completeness wins over the deadline.
 3. **Finalize** — a serial (conflict-free) pass re-applies every persistent record and deletes every ephemeral record, guaranteeing the deterministic end state.
-4. **Validation** — exact type counts, keyed spot-checks of values and edges, and ephemeral-absent assertions across both domains.
+4. **Validation** — complete, not sampled. Every persistent node is read back (paginated) and compared field-by-field to the generator: values, edges, geo coordinates, and timestamps. The node set must equal the expected set exactly, so any missing, extra (e.g. a leaked ephemeral), or mismatched record fails. Geo-index (`near`/`within`) and `shortest`-path queries are additionally checked for functional correctness.
 
 ## Determinism
 

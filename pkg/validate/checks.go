@@ -1,12 +1,19 @@
-// Package validate asserts the final graph matches the deterministic dataset:
-// exact type counts, ephemeral records absent, and keyed spot-checks of values
-// and edges across both the DQL and GraphQL domains.
+// Package validate asserts the final graph matches the deterministic dataset.
+// Because the generator is fully enumerable, verification is complete rather
+// than sampled: every persistent node is read back and compared field-by-field
+// (values, edges, geo, timestamps), and the node set must equal the expected
+// set exactly — so any missing, extra (e.g. a leaked ephemeral), or mismatched
+// record fails. Geo-index and shortest-path queries are additionally checked
+// for functional correctness.
 package validate
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"strings"
+	"time"
 
 	"github.com/dgraph-io/argus/pkg/cluster"
 	"github.com/dgraph-io/argus/pkg/graphql"
@@ -48,104 +55,475 @@ func (c *Checker) CheckAll(ctx context.Context) *Result {
 		}
 	}
 
-	// Exact type counts (ephemeral deleted, so only persistent remain).
-	c.checkCount(ctx, add, "Person", c.data.NumPersons)
-	c.checkCount(ctx, add, "Company", c.data.NumCompanies)
-	c.checkCount(ctx, add, "Post", c.data.NumPosts)
+	// Complete field-by-field verification of every persistent record. The
+	// node-set equality these perform also proves all ephemeral records are
+	// absent (they would show up as "extra").
+	c.checkAllCompanies(ctx, add)
+	c.checkAllPersons(ctx, add)
+	c.checkAllPosts(ctx, add)
+	c.checkAllCategories(ctx, add)
+	c.checkAllProducts(ctx, add)
 
-	// Ephemeral DQL node absent.
-	if exists, err := c.dqlExists(ctx, "person-eph-0"); err != nil {
-		add("dql-ephemeral-absent", false, err.Error())
-	} else {
-		add("dql-ephemeral-absent", !exists, fmt.Sprintf("person-eph-0 exists=%v", exists))
-	}
-
-	// DQL spot-check: person-0 values and edges.
-	c.checkPersonSpot(ctx, add)
-
-	// Geo: exact hits around cluster anchors and an expected miss.
+	// Functional correctness of index-backed queries.
 	c.checkGeo(ctx, add)
-
-	// Shortest path: Dgraph's result must match a BFS over the friend rule.
 	c.checkShortest(ctx, add, 0, 150)
 	c.checkShortest(ctx, add, 0, 13)
-
-	// GraphQL exact counts.
-	c.checkGQLCount(ctx, add, "aggregateProduct", c.data.NumProducts)
-	c.checkGQLCount(ctx, add, "aggregateCategory", c.data.NumCategories)
-
-	// Ephemeral GraphQL node absent + product spot-check.
-	c.checkProductSpot(ctx, add)
 
 	return r
 }
 
-func (c *Checker) checkCount(ctx context.Context, add func(string, bool, string), typ string, want int) {
-	got, err := c.dqlCount(ctx, typ)
-	if err != nil {
-		add("dql-count-"+typ, false, err.Error())
-		return
-	}
-	add("dql-count-"+typ, got == want, fmt.Sprintf("want %d got %d", want, got))
+// cmp accumulates the outcome of a complete entity comparison.
+type cmp struct {
+	verified, mismatch, missing, extra int
+	examples                           []string
 }
 
-func (c *Checker) checkPersonSpot(ctx context.Context, add func(string, bool, string)) {
-	want := c.data.Person(0)
-	q := `{ q(func: eq(xid, "person-0")) { name age company { xid } friends { xid } } }`
-	resp, err := c.query(ctx, q)
+func (m *cmp) ex(s string) {
+	if len(m.examples) < 3 {
+		m.examples = append(m.examples, s)
+	}
+}
+
+func (m *cmp) emit(name string, add func(string, bool, string)) {
+	ok := m.mismatch == 0 && m.missing == 0 && m.extra == 0
+	detail := fmt.Sprintf("%d verified, %d mismatch, %d missing, %d extra", m.verified, m.mismatch, m.missing, m.extra)
+	if len(m.examples) > 0 {
+		detail += " | " + strings.Join(m.examples, "; ")
+	}
+	add(name, ok, detail)
+}
+
+// --- complete DQL verification ---
+
+type xidRef struct {
+	Xid string `json:"xid"`
+}
+
+type geoPoint struct {
+	Type        string    `json:"type"`
+	Coordinates []float64 `json:"coordinates"`
+}
+
+type personNode struct {
+	Xid       string    `json:"xid"`
+	Name      string    `json:"name"`
+	Email     string    `json:"email"`
+	Age       int       `json:"age"`
+	Score     float64   `json:"score"`
+	Active    bool      `json:"active"`
+	Bio       string    `json:"bio"`
+	Tags      []string  `json:"tags_csv"`
+	Location  *geoPoint `json:"location"`
+	CreatedAt string    `json:"created_at"`
+	Company   *xidRef   `json:"company"`
+	Friends   []xidRef  `json:"friends"`
+}
+
+func (c *Checker) checkAllPersons(ctx context.Context, add func(string, bool, string)) {
+	const body = `xid name email age score active bio tags_csv location created_at company { xid } friends { xid }`
+	actual := map[string]personNode{}
+	if err := c.fetchAllDQL(ctx, "Person", body, func(raw json.RawMessage) error {
+		var p personNode
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		actual[p.Xid] = p
+		return nil
+	}); err != nil {
+		add("dql-persons-complete", false, err.Error())
+		return
+	}
+
+	m := &cmp{}
+	expected := make(map[string]bool, c.data.NumPersons)
+	for i := 0; i < c.data.NumPersons; i++ {
+		w := c.data.Person(i)
+		expected[w.Xid] = true
+		g, ok := actual[w.Xid]
+		if !ok {
+			m.missing++
+			m.ex("missing " + w.Xid)
+			continue
+		}
+		if diff := personDiff(w, g); diff != "" {
+			m.mismatch++
+			m.ex(w.Xid + ": " + diff)
+		} else {
+			m.verified++
+		}
+	}
+	for xid := range actual {
+		if !expected[xid] {
+			m.extra++
+			m.ex("extra " + xid)
+		}
+	}
+	m.emit("dql-persons-complete", add)
+}
+
+func personDiff(w testdata.Person, g personNode) string {
+	switch {
+	case g.Name != w.Name:
+		return fmt.Sprintf("name %q!=%q", g.Name, w.Name)
+	case g.Email != w.Email:
+		return "email"
+	case g.Age != w.Age:
+		return fmt.Sprintf("age %d!=%d", g.Age, w.Age)
+	case !floatEq(g.Score, w.Score):
+		return fmt.Sprintf("score %v!=%v", g.Score, w.Score)
+	case g.Active != w.Active:
+		return "active"
+	case g.Bio != w.Bio:
+		return "bio"
+	case !setEqual(g.Tags, w.Tags):
+		return "tags"
+	case g.Company == nil || g.Company.Xid != w.CompanyXid:
+		return "company"
+	case !refSetEqual(g.Friends, w.FriendXids):
+		return "friends"
+	case !geoEqual(g.Location, w.Location):
+		return "location"
+	case !timeEqual(g.CreatedAt, w.CreatedAt):
+		return "created_at"
+	}
+	return ""
+}
+
+type companyNode struct {
+	Xid     string `json:"xid"`
+	Name    string `json:"name"`
+	Domain  string `json:"domain"`
+	Founded string `json:"founded"`
+}
+
+func (c *Checker) checkAllCompanies(ctx context.Context, add func(string, bool, string)) {
+	actual := map[string]companyNode{}
+	if err := c.fetchAllDQL(ctx, "Company", `xid name domain founded`, func(raw json.RawMessage) error {
+		var n companyNode
+		if err := json.Unmarshal(raw, &n); err != nil {
+			return err
+		}
+		actual[n.Xid] = n
+		return nil
+	}); err != nil {
+		add("dql-companies-complete", false, err.Error())
+		return
+	}
+
+	m := &cmp{}
+	expected := make(map[string]bool, c.data.NumCompanies)
+	for i := 0; i < c.data.NumCompanies; i++ {
+		w := c.data.Company(i)
+		expected[w.Xid] = true
+		g, ok := actual[w.Xid]
+		if !ok {
+			m.missing++
+			m.ex("missing " + w.Xid)
+			continue
+		}
+		if g.Name != w.Name || g.Domain != w.Domain || !timeEqual(g.Founded, w.Founded) {
+			m.mismatch++
+			m.ex(w.Xid)
+		} else {
+			m.verified++
+		}
+	}
+	for xid := range actual {
+		if !expected[xid] {
+			m.extra++
+			m.ex("extra " + xid)
+		}
+	}
+	m.emit("dql-companies-complete", add)
+}
+
+type postNode struct {
+	Xid       string  `json:"xid"`
+	Title     string  `json:"title"`
+	Content   string  `json:"content"`
+	Likes     int     `json:"likes"`
+	CreatedAt string  `json:"created_at"`
+	Author    *xidRef `json:"author"`
+}
+
+func (c *Checker) checkAllPosts(ctx context.Context, add func(string, bool, string)) {
+	actual := map[string]postNode{}
+	if err := c.fetchAllDQL(ctx, "Post", `xid title content likes created_at author { xid }`, func(raw json.RawMessage) error {
+		var n postNode
+		if err := json.Unmarshal(raw, &n); err != nil {
+			return err
+		}
+		actual[n.Xid] = n
+		return nil
+	}); err != nil {
+		add("dql-posts-complete", false, err.Error())
+		return
+	}
+
+	m := &cmp{}
+	expected := make(map[string]bool, c.data.NumPosts)
+	for i := 0; i < c.data.NumPosts; i++ {
+		w := c.data.Post(i)
+		expected[w.Xid] = true
+		g, ok := actual[w.Xid]
+		if !ok {
+			m.missing++
+			m.ex("missing " + w.Xid)
+			continue
+		}
+		if g.Title != w.Title || g.Content != w.Content || g.Likes != w.Likes ||
+			!timeEqual(g.CreatedAt, w.CreatedAt) || g.Author == nil || g.Author.Xid != w.AuthorXid {
+			m.mismatch++
+			m.ex(w.Xid)
+		} else {
+			m.verified++
+		}
+	}
+	for xid := range actual {
+		if !expected[xid] {
+			m.extra++
+			m.ex("extra " + xid)
+		}
+	}
+	m.emit("dql-posts-complete", add)
+}
+
+// fetchAllDQL pages through every node of a type, invoking fn with each node's
+// raw JSON. Validation runs after the workload stops, so the graph is static
+// and offset pagination across read-only transactions is stable.
+func (c *Checker) fetchAllDQL(ctx context.Context, typ, body string, fn func(json.RawMessage) error) error {
+	const page = 2000
+	for offset := 0; ; offset += page {
+		q := fmt.Sprintf(`{ q(func: type(%s), first: %d, offset: %d) { %s } }`, typ, page, offset, body)
+		data, err := c.query(ctx, q)
+		if err != nil {
+			return err
+		}
+		var out struct {
+			Q []json.RawMessage `json:"q"`
+		}
+		if err := json.Unmarshal(data, &out); err != nil {
+			return err
+		}
+		for _, raw := range out.Q {
+			if err := fn(raw); err != nil {
+				return err
+			}
+		}
+		if len(out.Q) < page {
+			return nil
+		}
+	}
+}
+
+// --- complete GraphQL verification ---
+
+type reviewNode struct {
+	Key       string `json:"key"`
+	Title     string `json:"title"`
+	Body      string `json:"body"`
+	Stars     int    `json:"stars"`
+	Reviewer  string `json:"reviewer"`
+	CreatedAt string `json:"createdAt"`
+}
+
+type productNode struct {
+	SKU          string       `json:"sku"`
+	Name         string       `json:"name"`
+	Description  string       `json:"description"`
+	Price        float64      `json:"price"`
+	Availability string       `json:"availability"`
+	Rating       float64      `json:"rating"`
+	CreatedAt    string       `json:"createdAt"`
+	Category     *struct{ Slug string `json:"slug"` } `json:"category"`
+	Reviews      []reviewNode `json:"reviews"`
+}
+
+func (c *Checker) checkAllProducts(ctx context.Context, add func(string, bool, string)) {
+	actual := map[string]productNode{}
+	const page = 500
+	for offset := 0; ; offset += page {
+		q := fmt.Sprintf(`query {
+			queryProduct(first: %d, offset: %d) {
+				sku name description price availability rating createdAt
+				category { slug }
+				reviews { key title body stars reviewer createdAt }
+			}
+		}`, page, offset)
+		resp, err := c.gql.Query(ctx, q, nil)
+		if err != nil {
+			add("gql-products-complete", false, err.Error())
+			return
+		}
+		if len(resp.Errors) > 0 {
+			add("gql-products-complete", false, resp.Errors[0].Message)
+			return
+		}
+		var out struct {
+			QueryProduct []productNode `json:"queryProduct"`
+		}
+		if err := json.Unmarshal(resp.Data, &out); err != nil {
+			add("gql-products-complete", false, err.Error())
+			return
+		}
+		for _, p := range out.QueryProduct {
+			actual[p.SKU] = p
+		}
+		if len(out.QueryProduct) < page {
+			break
+		}
+	}
+
+	m := &cmp{}
+	expected := make(map[string]bool, c.data.NumProducts)
+	for i := 0; i < c.data.NumProducts; i++ {
+		w := c.data.Product(i)
+		expected[w.SKU] = true
+		g, ok := actual[w.SKU]
+		if !ok {
+			m.missing++
+			m.ex("missing " + w.SKU)
+			continue
+		}
+		if diff := c.productDiff(i, w, g); diff != "" {
+			m.mismatch++
+			m.ex(w.SKU + ": " + diff)
+		} else {
+			m.verified++
+		}
+	}
+	for sku := range actual {
+		if !expected[sku] {
+			m.extra++
+			m.ex("extra " + sku)
+		}
+	}
+	m.emit("gql-products-complete", add)
+}
+
+func (c *Checker) productDiff(idx int, w testdata.Product, g productNode) string {
+	switch {
+	case g.Name != w.Name:
+		return "name"
+	case g.Description != w.Description:
+		return "description"
+	case g.Availability != w.Availability:
+		return "availability"
+	case !floatEq(g.Price, w.Price):
+		return fmt.Sprintf("price %v!=%v", g.Price, w.Price)
+	case !floatEq(g.Rating, w.Rating):
+		return fmt.Sprintf("rating %v!=%v", g.Rating, w.Rating)
+	case !timeEqual(g.CreatedAt, w.CreatedAt):
+		return "createdAt"
+	case g.Category == nil || g.Category.Slug != w.CategorySlug:
+		return "category"
+	}
+	// Reviews: exact key set and per-review fields.
+	if len(g.Reviews) != c.data.ReviewsPerProduct {
+		return fmt.Sprintf("reviews count %d!=%d", len(g.Reviews), c.data.ReviewsPerProduct)
+	}
+	gotReviews := make(map[string]reviewNode, len(g.Reviews))
+	for _, rv := range g.Reviews {
+		gotReviews[rv.Key] = rv
+	}
+	for j := 0; j < c.data.ReviewsPerProduct; j++ {
+		wr := c.data.Review(idx, j)
+		gr, ok := gotReviews[wr.Key]
+		if !ok {
+			return "missing review " + wr.Key
+		}
+		if gr.Title != wr.Title || gr.Body != wr.Body || gr.Stars != wr.Stars ||
+			gr.Reviewer != wr.Reviewer || !timeEqual(gr.CreatedAt, wr.CreatedAt) {
+			return "review " + wr.Key
+		}
+	}
+	return ""
+}
+
+type categoryNode struct {
+	Slug string `json:"slug"`
+	Name string `json:"name"`
+}
+
+func (c *Checker) checkAllCategories(ctx context.Context, add func(string, bool, string)) {
+	resp, err := c.gql.Query(ctx, `query { queryCategory(first: 1000) { slug name } }`, nil)
 	if err != nil {
-		add("dql-person-spot", false, err.Error())
+		add("gql-categories-complete", false, err.Error())
+		return
+	}
+	if len(resp.Errors) > 0 {
+		add("gql-categories-complete", false, resp.Errors[0].Message)
 		return
 	}
 	var out struct {
-		Q []struct {
-			Name    string `json:"name"`
-			Age     int    `json:"age"`
-			Company *struct {
-				Xid string `json:"xid"`
-			} `json:"company"`
-			Friends []struct {
-				Xid string `json:"xid"`
-			} `json:"friends"`
-		} `json:"q"`
+		QueryCategory []categoryNode `json:"queryCategory"`
 	}
-	if err := json.Unmarshal(resp, &out); err != nil {
-		add("dql-person-spot", false, err.Error())
+	if err := json.Unmarshal(resp.Data, &out); err != nil {
+		add("gql-categories-complete", false, err.Error())
 		return
 	}
-	if len(out.Q) != 1 {
-		add("dql-person-spot", false, fmt.Sprintf("expected 1 node, got %d", len(out.Q)))
-		return
+	actual := make(map[string]categoryNode, len(out.QueryCategory))
+	for _, n := range out.QueryCategory {
+		actual[n.Slug] = n
 	}
-	got := out.Q[0]
-	ok := got.Name == want.Name && got.Age == want.Age && got.Company != nil && len(got.Friends) == len(want.FriendXids)
-	add("dql-person-spot", ok, fmt.Sprintf("name=%s/%s age=%d/%d company=%v friends=%d/%d",
-		got.Name, want.Name, got.Age, want.Age, got.Company != nil, len(got.Friends), len(want.FriendXids)))
+
+	m := &cmp{}
+	expected := make(map[string]bool, c.data.NumCategories)
+	for i := 0; i < c.data.NumCategories; i++ {
+		w := c.data.Category(i)
+		expected[w.Slug] = true
+		g, ok := actual[w.Slug]
+		if !ok {
+			m.missing++
+			m.ex("missing " + w.Slug)
+			continue
+		}
+		if g.Name != w.Name {
+			m.mismatch++
+			m.ex(w.Slug)
+		} else {
+			m.verified++
+		}
+	}
+	for slug := range actual {
+		if !expected[slug] {
+			m.extra++
+			m.ex("extra " + slug)
+		}
+	}
+	m.emit("gql-categories-complete", add)
 }
 
-func (c *Checker) checkProductSpot(ctx context.Context, add func(string, bool, string)) {
-	// Ephemeral absent.
-	absent, err := c.gqlGetProduct(ctx, "SKU-EPH-0")
-	if err != nil {
-		add("gql-ephemeral-absent", false, err.Error())
-	} else {
-		add("gql-ephemeral-absent", absent == nil, "SKU-EPH-0 should be deleted")
+// --- functional index/path checks ---
+
+// checkGeo asserts exact geo results: a near() and within() hit return their
+// cluster's exact count, and a near() over empty ocean returns zero.
+func (c *Checker) checkGeo(ctx context.Context, add func(string, bool, string)) {
+	geoCount := func(name, query string, want int) {
+		got, err := c.countQuery(ctx, query)
+		if err != nil {
+			add(name, false, err.Error())
+			return
+		}
+		add(name, got == want, fmt.Sprintf("want %d got %d", want, got))
 	}
 
-	// Persistent product spot-check.
-	want := c.data.Product(0)
-	got, err := c.gqlGetProduct(ctx, "SKU-0")
-	if err != nil {
-		add("gql-product-spot", false, err.Error())
-		return
-	}
-	if got == nil {
-		add("gql-product-spot", false, "SKU-0 missing")
-		return
-	}
-	ok := got.Name == want.Name && got.Category != nil && got.Category.Slug == want.CategorySlug && len(got.Reviews) == c.data.ReviewsPerProduct
-	add("gql-product-spot", ok, fmt.Sprintf("name=%s/%s category=%v reviews=%d/%d",
-		got.Name, want.Name, got.Category, len(got.Reviews), c.data.ReviewsPerProduct))
+	sf := testdata.GeoAnchors[0]
+	geoCount("geo-near-hit",
+		fmt.Sprintf(`{ q(func: near(location, [%g, %g], %d)) { c: count(uid) } }`, sf[0], sf[1], testdata.GeoNearRadiusM),
+		c.data.GeoClusterCount(0))
+
+	e := testdata.GeoEmptyPoint
+	geoCount("geo-near-miss",
+		fmt.Sprintf(`{ q(func: near(location, [%g, %g], %d)) { c: count(uid) } }`, e[0], e[1], testdata.GeoNearRadiusM),
+		0)
+
+	a := testdata.GeoAnchors[1]
+	poly := fmt.Sprintf("[[[%g,%g],[%g,%g],[%g,%g],[%g,%g],[%g,%g]]]",
+		a[0]-0.1, a[1]-0.1, a[0]+0.1, a[1]-0.1, a[0]+0.1, a[1]+0.1, a[0]-0.1, a[1]+0.1, a[0]-0.1, a[1]-0.1)
+	geoCount("geo-within-hit",
+		fmt.Sprintf(`{ q(func: within(location, %s)) { c: count(uid) } }`, poly),
+		c.data.GeoClusterCount(1))
 }
 
 // checkShortest asserts Dgraph's shortest friends path between two persons has
@@ -185,7 +563,7 @@ func (c *Checker) checkShortest(ctx context.Context, add func(string, bool, stri
 	add(name, len(out.Q) == want, fmt.Sprintf("want %d path nodes (%d hops), got %d", want, hops, len(out.Q)))
 }
 
-// --- DQL helpers ---
+// --- query + comparison helpers ---
 
 func (c *Checker) query(ctx context.Context, q string) ([]byte, error) {
 	txn := c.dgraph.ReadOnlyTxn()
@@ -195,10 +573,6 @@ func (c *Checker) query(ctx context.Context, q string) ([]byte, error) {
 		return nil, err
 	}
 	return resp.Json, nil
-}
-
-func (c *Checker) dqlCount(ctx context.Context, typ string) (int, error) {
-	return c.countQuery(ctx, fmt.Sprintf(`{ q(func: type(%s)) { c: count(uid) } }`, typ))
 }
 
 // countQuery runs a DQL query whose root block `q` projects `c: count(uid)`.
@@ -221,107 +595,66 @@ func (c *Checker) countQuery(ctx context.Context, query string) (int, error) {
 	return out.Q[0].C, nil
 }
 
-// checkGeo asserts exact geo results: a near() and within() hit return their
-// cluster's exact count, and a near() over empty ocean returns zero.
-func (c *Checker) checkGeo(ctx context.Context, add func(string, bool, string)) {
-	geoCount := func(name, query string, want int) {
-		got, err := c.countQuery(ctx, query)
-		if err != nil {
-			add(name, false, err.Error())
-			return
+func floatEq(a, b float64) bool { return math.Abs(a-b) < 1e-6 }
+
+func setEqual(a, b []string) bool {
+	sa, sb := toSet(a), toSet(b)
+	if len(sa) != len(sb) {
+		return false
+	}
+	for k := range sa {
+		if !sb[k] {
+			return false
 		}
-		add(name, got == want, fmt.Sprintf("want %d got %d", want, got))
 	}
-
-	// Hit: tight radius around cluster 0's anchor returns exactly that cluster.
-	sf := testdata.GeoAnchors[0]
-	geoCount("geo-near-hit",
-		fmt.Sprintf(`{ q(func: near(location, [%g, %g], %d)) { c: count(uid) } }`, sf[0], sf[1], testdata.GeoNearRadiusM),
-		c.data.GeoClusterCount(0))
-
-	// Expected miss: open ocean, far from every cluster.
-	e := testdata.GeoEmptyPoint
-	geoCount("geo-near-miss",
-		fmt.Sprintf(`{ q(func: near(location, [%g, %g], %d)) { c: count(uid) } }`, e[0], e[1], testdata.GeoNearRadiusM),
-		0)
-
-	// Hit: a ±0.1° box around cluster 1's anchor returns exactly that cluster.
-	a := testdata.GeoAnchors[1]
-	poly := fmt.Sprintf("[[[%g,%g],[%g,%g],[%g,%g],[%g,%g],[%g,%g]]]",
-		a[0]-0.1, a[1]-0.1, a[0]+0.1, a[1]-0.1, a[0]+0.1, a[1]+0.1, a[0]-0.1, a[1]+0.1, a[0]-0.1, a[1]-0.1)
-	geoCount("geo-within-hit",
-		fmt.Sprintf(`{ q(func: within(location, %s)) { c: count(uid) } }`, poly),
-		c.data.GeoClusterCount(1))
+	return true
 }
 
-func (c *Checker) dqlExists(ctx context.Context, xid string) (bool, error) {
-	q := fmt.Sprintf(`{ q(func: eq(xid, %q)) { uid } }`, xid)
-	data, err := c.query(ctx, q)
-	if err != nil {
-		return false, err
+func refSetEqual(got []xidRef, want []string) bool {
+	g := make([]string, 0, len(got))
+	for _, r := range got {
+		g = append(g, r.Xid)
 	}
-	var out struct {
-		Q []struct {
-			Uid string `json:"uid"`
-		} `json:"q"`
-	}
-	if err := json.Unmarshal(data, &out); err != nil {
-		return false, err
-	}
-	return len(out.Q) > 0, nil
+	return setEqual(g, want)
 }
 
-// --- GraphQL helpers ---
-
-type gqlProduct struct {
-	SKU      string `json:"sku"`
-	Name     string `json:"name"`
-	Category *struct {
-		Slug string `json:"slug"`
-	} `json:"category"`
-	Reviews []struct {
-		Key string `json:"key"`
-	} `json:"reviews"`
+func toSet(xs []string) map[string]bool {
+	m := make(map[string]bool, len(xs))
+	for _, x := range xs {
+		m[x] = true
+	}
+	return m
 }
 
-func (c *Checker) gqlGetProduct(ctx context.Context, sku string) (*gqlProduct, error) {
-	const q = `query($sku: String!) {
-		getProduct(sku: $sku) { sku name category { slug } reviews { key } }
-	}`
-	resp, err := c.gql.Query(ctx, q, map[string]interface{}{"sku": sku})
-	if err != nil {
-		return nil, err
+func geoEqual(got *geoPoint, want string) bool {
+	if want == "" {
+		return got == nil
 	}
-	if len(resp.Errors) > 0 {
-		return nil, fmt.Errorf("graphql: %s", resp.Errors[0].Message)
+	if got == nil || len(got.Coordinates) != 2 {
+		return false
 	}
-	var out struct {
-		GetProduct *gqlProduct `json:"getProduct"`
+	var w geoPoint
+	if json.Unmarshal([]byte(want), &w) != nil || len(w.Coordinates) != 2 {
+		return false
 	}
-	if err := json.Unmarshal(resp.Data, &out); err != nil {
-		return nil, err
-	}
-	return out.GetProduct, nil
+	return math.Abs(got.Coordinates[0]-w.Coordinates[0]) < 1e-5 &&
+		math.Abs(got.Coordinates[1]-w.Coordinates[1]) < 1e-5
 }
 
-func (c *Checker) checkGQLCount(ctx context.Context, add func(string, bool, string), field string, want int) {
-	q := fmt.Sprintf(`{ %s { count } }`, field)
-	resp, err := c.gql.Query(ctx, q, nil)
-	if err != nil {
-		add("gql-"+field, false, err.Error())
-		return
+func timeEqual(a, b string) bool {
+	ta, ea := parseTime(a)
+	tb, eb := parseTime(b)
+	if ea != nil || eb != nil {
+		return a == b
 	}
-	if len(resp.Errors) > 0 {
-		add("gql-"+field, false, resp.Errors[0].Message)
-		return
+	return ta.Equal(tb)
+}
+
+func parseTime(s string) (time.Time, error) {
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
 	}
-	var out map[string]struct {
-		Count int `json:"count"`
-	}
-	if err := json.Unmarshal(resp.Data, &out); err != nil {
-		add("gql-"+field, false, err.Error())
-		return
-	}
-	got := out[field].Count
-	add("gql-"+field, got == want, fmt.Sprintf("want %d got %d", want, got))
+	return time.Time{}, fmt.Errorf("unparseable time %q", s)
 }
