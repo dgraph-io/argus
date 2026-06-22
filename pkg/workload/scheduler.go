@@ -6,6 +6,7 @@ package workload
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -86,7 +87,7 @@ func (s *Scheduler) Run(ctx context.Context, deadline time.Time) error {
 			break
 		}
 		slog.Info("write pass starting", "pass", passes+1)
-		s.WritePass(ctx, s.cfg.WriteConcurrency, timedWriteAttempts)
+		s.WritePass(ctx, s.cfg.WriteConcurrency, timedWriteAttempts, true)
 		passes++
 		slog.Info("write pass complete", "pass", passes)
 	}
@@ -110,7 +111,7 @@ func (s *Scheduler) Run(ctx context.Context, deadline time.Time) error {
 // retrying each write up to `attempts` times on transaction conflict. Stages run
 // sequentially (create-before-link ordering); work within a stage is fanned out
 // across `conc` workers.
-func (s *Scheduler) WritePass(ctx context.Context, conc, attempts int) {
+func (s *Scheduler) WritePass(ctx context.Context, conc, attempts int, ledger bool) {
 	d := s.cfg.Dataset
 
 	// Stage 1: categories and companies (referenced by later stages).
@@ -188,6 +189,34 @@ func (s *Scheduler) WritePass(ctx context.Context, conc, attempts int) {
 		})
 	}
 	runPool(ctx, conc, stage3)
+
+	if !ledger {
+		return
+	}
+
+	// Stage 4 (timed phase only): ledger churn. Each post's likes and each
+	// product's price is incremented then decremented by a deterministic delta
+	// via read-modify-write, exercising in-place mutation under concurrent load.
+	// The +d/-d pair nets to zero; the canonical value is pinned by the normal
+	// (ledger-free) finalize pass and verified by the complete checks.
+	ledgerTasks := make([]task, 0, d.NumPosts+d.NumProducts)
+	for i := 0; i < d.NumPosts; i++ {
+		xid := d.Post(i).Xid
+		delta := d.PostLikeDelta(i)
+		ledgerTasks = append(ledgerTasks, func(ctx context.Context) {
+			s.rmwLikes(ctx, xid, delta, attempts)
+			s.rmwLikes(ctx, xid, -delta, attempts)
+		})
+	}
+	for i := 0; i < d.NumProducts; i++ {
+		sku := d.Product(i).SKU
+		delta := d.ProductPriceDelta(i)
+		ledgerTasks = append(ledgerTasks, func(ctx context.Context) {
+			s.rmwPrice(ctx, sku, delta)
+			s.rmwPrice(ctx, sku, -delta)
+		})
+	}
+	runPool(ctx, conc, ledgerTasks)
 }
 
 // Finalize guarantees the deterministic end state. It runs serially (no
@@ -197,8 +226,9 @@ func (s *Scheduler) WritePass(ctx context.Context, conc, attempts int) {
 func (s *Scheduler) Finalize(ctx context.Context) {
 	d := s.cfg.Dataset
 
-	// Serial full pass pins every persistent record's values and edges.
-	s.WritePass(ctx, 1, finalizeWriteAttempts)
+	// Serial full pass pins every persistent record's values and edges. Ledger
+	// churn is disabled here so likes/price settle to their canonical values.
+	s.WritePass(ctx, 1, finalizeWriteAttempts, false)
 
 	// Explicitly delete every ephemeral key in case the churn above was
 	// interrupted between create and delete.
@@ -298,6 +328,111 @@ func (s *Scheduler) gqlExec(ctx context.Context, key, query string, vars map[str
 	}
 	s.observe(key, d, serverNs, touched, err)
 	s.onErr(key, err)
+}
+
+// rmwLikes performs an optimistic-concurrency read-modify-write on a post's
+// likes within one transaction: it reads the current value, writes value+delta,
+// and commits — which aborts (and retries) if another writer touched likes
+// meanwhile. This genuinely exercises Dgraph's transaction conflict handling.
+func (s *Scheduler) rmwLikes(ctx context.Context, xid string, delta, attempts int) {
+	start := time.Now()
+	label := "likes-incr"
+	if delta < 0 {
+		label = "likes-decr"
+	}
+	var err error
+	for a := 0; a < attempts; a++ {
+		txn := s.dgraph.Txn()
+		var resp *api.Response
+		resp, err = txn.Query(ctx, fmt.Sprintf(`{ q(func: eq(xid, %q)) { uid likes } }`, xid))
+		if err != nil {
+			txn.Discard(ctx)
+			if ctx.Err() != nil {
+				break
+			}
+			backoff(a)
+			continue
+		}
+		uid, cur, found := parseUIDLikes(resp.Json)
+		if !found {
+			txn.Discard(ctx)
+			return // post not yet created this instant; skip silently
+		}
+		mu := &api.Mutation{SetNquads: []byte(fmt.Sprintf("<%s> <likes> \"%d\"^^<xs:int> .", uid, cur+delta))}
+		if _, err = txn.Mutate(ctx, mu); err == nil {
+			err = txn.Commit(ctx)
+		}
+		txn.Discard(ctx)
+		if err == nil || ctx.Err() != nil || !isConflict(err) {
+			break
+		}
+		backoff(a)
+	}
+	s.observe(metrics.OpDQLLedger+":"+label, time.Since(start), 0, 0, err)
+	s.onErr("dql-ledger:"+label, err)
+}
+
+// rmwPrice performs a read-modify-write on a product's price over GraphQL
+// (get then updateProduct). GraphQL has no client transaction, so this is
+// last-write-wins rather than conflict-detected.
+func (s *Scheduler) rmwPrice(ctx context.Context, sku string, delta float64) {
+	start := time.Now()
+	label := "price-incr"
+	if delta < 0 {
+		label = "price-decr"
+	}
+	cur, found, err := s.getPrice(ctx, sku)
+	if err == nil && !found {
+		return // product not yet created this instant; skip silently
+	}
+	if err == nil {
+		const mut = `mutation($sku: String!, $p: Float!) {
+			updateProduct(input: { filter: { sku: { eq: $sku } }, set: { price: $p } }) { numUids }
+		}`
+		var resp *graphql.Response
+		resp, err = s.gql.Query(ctx, mut, map[string]interface{}{"sku": sku, "p": cur + delta})
+		if err == nil && resp != nil && len(resp.Errors) > 0 {
+			err = fmt.Errorf("graphql: %s", resp.Errors[0].Message)
+		}
+	}
+	s.observe(metrics.OpGQLLedger+":"+label, time.Since(start), 0, 0, err)
+	s.onErr("gql-ledger:"+label, err)
+}
+
+func (s *Scheduler) getPrice(ctx context.Context, sku string) (float64, bool, error) {
+	resp, err := s.gql.Query(ctx, `query($sku: String!) { getProduct(sku: $sku) { price } }`,
+		map[string]interface{}{"sku": sku})
+	if err != nil {
+		return 0, false, err
+	}
+	if len(resp.Errors) > 0 {
+		return 0, false, fmt.Errorf("graphql: %s", resp.Errors[0].Message)
+	}
+	var out struct {
+		GetProduct *struct {
+			Price float64 `json:"price"`
+		} `json:"getProduct"`
+	}
+	if err := json.Unmarshal(resp.Data, &out); err != nil {
+		return 0, false, err
+	}
+	if out.GetProduct == nil {
+		return 0, false, nil
+	}
+	return out.GetProduct.Price, true, nil
+}
+
+func parseUIDLikes(data []byte) (uid string, likes int, found bool) {
+	var out struct {
+		Q []struct {
+			UID   string `json:"uid"`
+			Likes int    `json:"likes"`
+		} `json:"q"`
+	}
+	if json.Unmarshal(data, &out) != nil || len(out.Q) == 0 {
+		return "", 0, false
+	}
+	return out.Q[0].UID, out.Q[0].Likes, true
 }
 
 func (s *Scheduler) observe(key string, d time.Duration, serverNs, touched uint64, err error) {

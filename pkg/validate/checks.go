@@ -35,14 +35,16 @@ type Result struct {
 
 // Checker runs deterministic correctness checks.
 type Checker struct {
-	dgraph *cluster.DgraphClient
-	gql    *graphql.Client
-	data   testdata.Dataset
+	dgraph       *cluster.DgraphClient
+	gql          *graphql.Client
+	data         testdata.Dataset
+	vectorStrict bool
 }
 
-// NewChecker creates a checker for the given dataset.
-func NewChecker(dgraph *cluster.DgraphClient, gql *graphql.Client, data testdata.Dataset) *Checker {
-	return &Checker{dgraph: dgraph, gql: gql, data: data}
+// NewChecker creates a checker for the given dataset. vectorStrict additionally
+// asserts exact similar_to nearest-neighbor recall (a regression gate).
+func NewChecker(dgraph *cluster.DgraphClient, gql *graphql.Client, data testdata.Dataset, vectorStrict bool) *Checker {
+	return &Checker{dgraph: dgraph, gql: gql, data: data, vectorStrict: vectorStrict}
 }
 
 // CheckAll runs every check and returns the aggregate result.
@@ -102,6 +104,32 @@ func (c *Checker) checkVector(ctx context.Context, add func(string, bool, string
 	vec := testdata.FormatVector(c.data.Person(target).Embedding)
 	c.countCheck(ctx, add, "vector-topk-count",
 		fmt.Sprintf(`{ q(func: similar_to(embedding, %d, "%s")) { c: count(uid) } }`, k, vec), k)
+
+	if !c.vectorStrict {
+		return
+	}
+	// Regression gate: a person's own embedding must retrieve that person as the
+	// nearest neighbor. Expected to fail on builds where repeated upserts degrade
+	// the HNSW index.
+	data, err := c.query(ctx, fmt.Sprintf(`{ q(func: similar_to(embedding, 1, "%s")) { xid } }`, vec))
+	if err != nil {
+		add("vector-self-match", false, err.Error())
+		return
+	}
+	var out struct {
+		Q []struct {
+			Xid string `json:"xid"`
+		} `json:"q"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		add("vector-self-match", false, err.Error())
+		return
+	}
+	got := "none"
+	if len(out.Q) > 0 {
+		got = out.Q[0].Xid
+	}
+	add("vector-self-match", len(out.Q) == 1 && got == "person-7", fmt.Sprintf("nearest want person-7 got %s", got))
 }
 
 // checkNgram asserts ngram(bio, "engineer") returns exactly the persons whose

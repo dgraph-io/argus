@@ -373,6 +373,20 @@ func (d Dataset) Review(productIdx, j int) Review {
 	}
 }
 
+// PostLikeDelta is the deterministic amount the ledger workload adds and then
+// subtracts from post i's likes during the run. The +d/-d pair nets to zero, so
+// the canonical value Post(i).Likes is what the field settles to (and is pinned
+// by the finalize upsert and verified).
+func (d Dataset) PostLikeDelta(i int) int {
+	return 1 + det(6_000_000+i).Intn(50)
+}
+
+// ProductPriceDelta is the deterministic amount the ledger workload adds and
+// then subtracts from product i's price during the run.
+func (d Dataset) ProductPriceDelta(i int) float64 {
+	return float64(1+det(7_000_000+i).Intn(1000)) / 100.0
+}
+
 func pickTags(r *rand.Rand) []string {
 	n := 1 + r.Intn(3)
 	out := make([]string, 0, n)

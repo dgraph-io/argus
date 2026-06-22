@@ -26,6 +26,7 @@ type Options struct {
 	WriteConcurrency int
 	ReadConcurrency  int
 	Strict           bool
+	VectorStrict     bool
 	Dataset          testdata.Dataset
 }
 
@@ -80,7 +81,7 @@ func (o *Orchestrator) Run(ctx context.Context) (*validate.Result, error) {
 	o.flush(start) // final snapshot
 
 	slog.Info("validating final graph")
-	result := validate.NewChecker(o.dgraph, o.gql, o.opts.Dataset).CheckAll(ctx)
+	result := validate.NewChecker(o.dgraph, o.gql, o.opts.Dataset, o.opts.VectorStrict).CheckAll(ctx)
 	o.logValidation(result)
 
 	if workloadErr != nil {

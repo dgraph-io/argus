@@ -29,6 +29,7 @@ func main() {
 	seed := flag.Int64("seed", 1, "Dataset seed (reserved; dataset is index-deterministic)")
 	small := flag.Bool("small", false, "Use the small dataset for smoke tests")
 	strict := flag.Bool("strict", false, "Fail fast on the first error (default: log and continue)")
+	vectorStrict := flag.Bool("vector-strict", false, "Assert exact similar_to nearest-neighbor recall (regression gate; expected to fail on builds with the HNSW upsert issue)")
 	verbose := flag.Bool("v", false, "Verbose logging")
 	flag.Parse()
 
@@ -61,6 +62,7 @@ func main() {
 		seed:          *seed,
 		small:         *small,
 		strict:        *strict,
+		vectorStrict:  *vectorStrict,
 	}
 
 	if err := run(ctx, cfg); err != nil {
@@ -81,6 +83,7 @@ type runConfig struct {
 	seed          int64
 	small         bool
 	strict        bool
+	vectorStrict  bool
 }
 
 func run(ctx context.Context, cfg runConfig) error {
@@ -125,6 +128,7 @@ func run(ctx context.Context, cfg runConfig) error {
 		WriteConcurrency: cfg.writeConc,
 		ReadConcurrency:  cfg.readConc,
 		Strict:           cfg.strict,
+		VectorStrict:     cfg.vectorStrict,
 		Dataset:          dataset,
 	})
 

@@ -20,6 +20,8 @@ const (
 	OpGQLWrite  = "gql-write"
 	OpGQLDelete = "gql-delete"
 	OpGQLQuery  = "gql-query"
+	OpDQLLedger = "dql-ledger"
+	OpGQLLedger = "gql-ledger"
 )
 
 type window struct {
