@@ -75,7 +75,7 @@ func (c *Checker) checkDataExists(ctx context.Context) error {
 	}
 
 	var result map[string]interface{}
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := json.Unmarshal(resp.Json, &result); err != nil {
 		return err
 	}
 
@@ -104,7 +104,7 @@ func (c *Checker) checkPersonTypeCount(ctx context.Context) error {
 	}
 
 	var result map[string]interface{}
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := json.Unmarshal(resp.Json, &result); err != nil {
 		return err
 	}
 

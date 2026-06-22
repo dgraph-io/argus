@@ -50,15 +50,14 @@ func (c *DgraphClient) Health(ctx context.Context) error {
 
 // Version retrieves the Dgraph cluster version.
 func (c *DgraphClient) Version(ctx context.Context) (string, error) {
-	state, err := c.Client.NewReadOnlyTxn().QueryWithRwSet(ctx, "{ version(func: type(dgraph.type)) { uid } }")
+	// Query a simple predicate to ensure cluster is responsive
+	// Version info would typically be in gRPC headers from the cluster
+	_, err := c.Client.NewReadOnlyTxn().Query(ctx, `{ q(func: has(uid)) { uid } }`)
 	if err != nil {
-		return "", fmt.Errorf("failed to query cluster state: %w", err)
+		return "", fmt.Errorf("failed to query cluster: %w", err)
 	}
-
-	// The version info is in the gRPC response headers, which dgo doesn't expose easily.
-	// For now, return a placeholder; in practice we'd need to parse this from cluster headers.
-	_ = state
-	slog.Debug("version query executed", "txn_start_ts", state.TxnStartTs)
+	// Return a placeholder version; in production, parse from cluster headers
+	slog.Debug("version query executed")
 	return "unknown", nil
 }
 
