@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /Users/matthew/code/dgo -type f \\\\\\( -name \"*.proto\" -o -name \"*.go\" \\\\\\) | head -30)",
+      "Read(//Users/matthew/code/dgo/**)",
+      "Bash(sed -n '/^message Operation/,/^}/p' /Users/matthew/code/dgo/protos/api.proto)"
+    ],
+    "additionalDirectories": [
+      "/Users/matthew/code/dgo/protos"
+    ]
+  }
+}
