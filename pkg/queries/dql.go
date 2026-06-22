@@ -108,6 +108,26 @@ func DQLQueries() []DQLQuery {
 			Query: `{ q(func: within(location, [[[-74.1, 40.61], [-73.9, 40.61], [-73.9, 40.81], [-74.1, 40.81], [-74.1, 40.61]]])) { uid name } }`,
 		},
 		{
+			// Shortest path across a deep span of the friends subgraph (~24 hops).
+			Label: "shortest-friends-deep",
+			Query: `{
+				a as var(func: eq(xid, "person-0"))
+				b as var(func: eq(xid, "person-150"))
+				path as shortest(from: uid(a), to: uid(b)) { friends }
+				q(func: uid(path)) { uid xid }
+			}`,
+		},
+		{
+			// Shortest path across a shorter span (~7 hops).
+			Label: "shortest-friends-short",
+			Query: `{
+				a as var(func: eq(xid, "person-0"))
+				b as var(func: eq(xid, "person-13"))
+				path as shortest(from: uid(a), to: uid(b)) { friends }
+				q(func: uid(path)) { uid xid }
+			}`,
+		},
+		{
 			Label: "vars-eq-lookup",
 			Query: `query q($a: int) { q(func: eq(age, $a), first: 25) { uid name age } }`,
 			Vars:  map[string]string{"$a": "30"},

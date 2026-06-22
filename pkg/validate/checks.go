@@ -66,6 +66,10 @@ func (c *Checker) CheckAll(ctx context.Context) *Result {
 	// Geo: exact hits around cluster anchors and an expected miss.
 	c.checkGeo(ctx, add)
 
+	// Shortest path: Dgraph's result must match a BFS over the friend rule.
+	c.checkShortest(ctx, add, 0, 150)
+	c.checkShortest(ctx, add, 0, 13)
+
 	// GraphQL exact counts.
 	c.checkGQLCount(ctx, add, "aggregateProduct", c.data.NumProducts)
 	c.checkGQLCount(ctx, add, "aggregateCategory", c.data.NumCategories)
@@ -142,6 +146,43 @@ func (c *Checker) checkProductSpot(ctx context.Context, add func(string, bool, s
 	ok := got.Name == want.Name && got.Category != nil && got.Category.Slug == want.CategorySlug && len(got.Reviews) == c.data.ReviewsPerProduct
 	add("gql-product-spot", ok, fmt.Sprintf("name=%s/%s category=%v reviews=%d/%d",
 		got.Name, want.Name, got.Category, len(got.Reviews), c.data.ReviewsPerProduct))
+}
+
+// checkShortest asserts Dgraph's shortest friends path between two persons has
+// the exact node count predicted by a BFS over the deterministic friend rule
+// (hops + 1). Skipped if an endpoint is outside the dataset.
+func (c *Checker) checkShortest(ctx context.Context, add func(string, bool, string), from, to int) {
+	name := fmt.Sprintf("shortest-%d-to-%d", from, to)
+	if from >= c.data.NumPersons || to >= c.data.NumPersons {
+		return
+	}
+	hops := c.data.ShortestFriendHops(from, to)
+	if hops < 0 {
+		add(name, false, "BFS found no path")
+		return
+	}
+	q := fmt.Sprintf(`{
+		a as var(func: eq(xid, "person-%d"))
+		b as var(func: eq(xid, "person-%d"))
+		path as shortest(from: uid(a), to: uid(b)) { friends }
+		q(func: uid(path)) { uid }
+	}`, from, to)
+	data, err := c.query(ctx, q)
+	if err != nil {
+		add(name, false, err.Error())
+		return
+	}
+	var out struct {
+		Q []struct {
+			Uid string `json:"uid"`
+		} `json:"q"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		add(name, false, err.Error())
+		return
+	}
+	want := hops + 1
+	add(name, len(out.Q) == want, fmt.Sprintf("want %d path nodes (%d hops), got %d", want, hops, len(out.Q)))
 }
 
 // --- DQL helpers ---

@@ -147,13 +147,54 @@ func (d Dataset) Person(i int) Person {
 		CreatedAt:  baseTime.Add(time.Duration(i) * time.Hour).Format(time.RFC3339),
 		CompanyXid: fmt.Sprintf("company-%d", i%d.NumCompanies),
 	}
-	if d.NumPersons > 8 {
-		p.FriendXids = []string{
-			fmt.Sprintf("person-%d", (i+1)%d.NumPersons),
-			fmt.Sprintf("person-%d", (i+7)%d.NumPersons),
-		}
+	for _, fi := range d.friendIndices(i) {
+		p.FriendXids = append(p.FriendXids, fmt.Sprintf("person-%d", fi))
 	}
 	return p
+}
+
+// friendOffsets define the deterministic out-edges of the friends graph: a +1
+// ring connects everyone, and a +7 shortcut keeps shortest paths non-trivial.
+// BFS over these offsets predicts Dgraph's shortest-path length exactly.
+var friendOffsets = []int{1, 7}
+
+// friendIndices returns person i's out-edge target indices (empty for tiny
+// datasets where a deep subgraph is not meaningful).
+func (d Dataset) friendIndices(i int) []int {
+	if d.NumPersons <= 8 {
+		return nil
+	}
+	out := make([]int, 0, len(friendOffsets))
+	for _, o := range friendOffsets {
+		out = append(out, (i+o)%d.NumPersons)
+	}
+	return out
+}
+
+// ShortestFriendHops returns the minimum number of directed friends edges from
+// person `from` to person `to`, or -1 if unreachable. It is a plain BFS over
+// the deterministic friend rule, used as the oracle for shortest-path checks.
+func (d Dataset) ShortestFriendHops(from, to int) int {
+	if from == to {
+		return 0
+	}
+	dist := map[int]int{from: 0}
+	queue := []int{from}
+	for len(queue) > 0 {
+		u := queue[0]
+		queue = queue[1:]
+		for _, v := range d.friendIndices(u) {
+			if _, seen := dist[v]; seen {
+				continue
+			}
+			dist[v] = dist[u] + 1
+			if v == to {
+				return dist[v]
+			}
+			queue = append(queue, v)
+		}
+	}
+	return -1
 }
 
 // EphPerson returns the ephemeral (delete-target) person at index i. It is
