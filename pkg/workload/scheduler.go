@@ -126,18 +126,42 @@ func (s *Scheduler) WritePass(ctx context.Context, conc, attempts int) {
 	runPool(ctx, conc, stage1)
 
 	// Stage 2: persons, products, posts, reviews — mixed DQL+GraphQL load.
+	// DQL writes are split 50/50 by index: even indices go through single-record
+	// upserts, odd indices are packed into bulk upserts (~BulkEdgeTarget edges
+	// each). Both styles carry distinct labels so the CSV can compare them.
 	stage2 := make([]task, 0, d.NumPersons+d.NumProducts+d.NumPosts+d.NumProducts*d.ReviewsPerProduct)
+
+	var bulkPersons []testdata.Person
 	for i := 0; i < d.NumPersons; i++ {
 		p := d.Person(i)
-		stage2 = append(stage2, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLWrite, "person", testdata.PersonUpsert(p), attempts) })
+		if i%2 == 0 {
+			stage2 = append(stage2, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLWrite, "person", testdata.PersonUpsert(p), attempts) })
+		} else {
+			bulkPersons = append(bulkPersons, p)
+		}
 	}
+	for _, req := range testdata.BulkPersonUpserts(bulkPersons, testdata.BulkEdgeTarget) {
+		r := req
+		stage2 = append(stage2, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLWrite, "person-bulk", r, attempts) })
+	}
+
+	var bulkPosts []testdata.Post
+	for i := 0; i < d.NumPosts; i++ {
+		p := d.Post(i)
+		if i%2 == 0 {
+			stage2 = append(stage2, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLWrite, "post", testdata.PostUpsert(p), attempts) })
+		} else {
+			bulkPosts = append(bulkPosts, p)
+		}
+	}
+	for _, req := range testdata.BulkPostUpserts(bulkPosts, testdata.BulkEdgeTarget) {
+		r := req
+		stage2 = append(stage2, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLWrite, "post-bulk", r, attempts) })
+	}
+
 	for i := 0; i < d.NumProducts; i++ {
 		p := d.Product(i)
 		stage2 = append(stage2, func(ctx context.Context) { s.gqlWrite(ctx, "product", testdata.AddProduct(p), attempts) })
-	}
-	for i := 0; i < d.NumPosts; i++ {
-		p := d.Post(i)
-		stage2 = append(stage2, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLWrite, "post", testdata.PostUpsert(p), attempts) })
 	}
 	for i := 0; i < d.NumProducts; i++ {
 		for j := 0; j < d.ReviewsPerProduct; j++ {

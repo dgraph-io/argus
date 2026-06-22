@@ -35,13 +35,36 @@ func TestPersonUpsertRDF(t *testing.T) {
 	if strings.Contains(nq, "^^<xs:bool>") {
 		t.Errorf("found invalid xs:bool RDF type; nquads:\n%s", nq)
 	}
-	for _, want := range []string{`uid(v) <xid> "person-0"`, `<dgraph.type> "Person"`, `uid(v) <company> uid(c)`, `uid(v) <friends> uid(f0)`} {
+	for _, want := range []string{`<xid> "person-0"`, `<dgraph.type> "Person"`, `<company> uid(`, `<friends> uid(`} {
 		if !strings.Contains(nq, want) {
 			t.Errorf("missing %q in nquads:\n%s", want, nq)
 		}
 	}
 	if !req.CommitNow {
 		t.Error("upsert request should set CommitNow")
+	}
+}
+
+func TestBulkPersonUpserts(t *testing.T) {
+	d := SmallDataset()
+	persons := make([]Person, 0, d.NumPersons/2)
+	for i := 1; i < d.NumPersons; i += 2 { // odd indices, as the scheduler routes them
+		persons = append(persons, d.Person(i))
+	}
+	reqs := BulkPersonUpserts(persons, BulkEdgeTarget)
+	if len(reqs) < 2 {
+		t.Fatalf("expected multiple bulk requests, got %d", len(reqs))
+	}
+	// Each batch (except possibly the last) should carry roughly BulkEdgeTarget
+	// edges: count nquad lines and confirm batching actually happened.
+	first := strings.Count(string(reqs[0].Mutations[0].SetNquads), " .\n")
+	if first < BulkEdgeTarget || first > BulkEdgeTarget+40 {
+		t.Errorf("first bulk batch has %d edges, want ~%d", first, BulkEdgeTarget)
+	}
+	// A bulk batch packs many distinct persons: it must reference several xids.
+	q := reqs[0].Query
+	if strings.Count(q, "as var(func: eq(xid,") < 4 {
+		t.Errorf("bulk query block should bind several xids:\n%s", q)
 	}
 }
 
