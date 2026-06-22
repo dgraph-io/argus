@@ -1,0 +1,376 @@
+// Package workload runs the concurrent read/write benchmark. Writers and
+// readers execute simultaneously over the time budget. Writes are idempotent
+// upserts partitioned by stable key, so the graph converges deterministically;
+// a finalize pass pins the end state (persistent upserted, ephemeral deleted).
+package workload
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/dgraph-io/argus/pkg/cluster"
+	"github.com/dgraph-io/argus/pkg/graphql"
+	"github.com/dgraph-io/argus/pkg/metrics"
+	"github.com/dgraph-io/argus/pkg/queries"
+	"github.com/dgraph-io/argus/pkg/testdata"
+	"github.com/dgraph-io/dgo/v250/protos/api"
+)
+
+// Retry budgets for write upserts. Concurrent cross-referencing upserts (a
+// person writes its friends' keys) conflict and abort; dgo does not auto-retry.
+// The timed phase retries a few times (best-effort load); the finalize pass
+// runs serially with a generous budget so the deterministic end state is
+// guaranteed to commit.
+const (
+	timedWriteAttempts    = 4
+	finalizeWriteAttempts = 50
+)
+
+// Config tunes concurrency and the dataset.
+type Config struct {
+	WriteConcurrency int
+	ReadConcurrency  int
+	Dataset          testdata.Dataset
+	Strict           bool
+}
+
+// Scheduler executes the mixed workload against the cluster.
+type Scheduler struct {
+	dgraph    *cluster.DgraphClient
+	gql       *graphql.Client
+	collector *metrics.Collector
+	cfg       Config
+
+	cancel   context.CancelFunc
+	errMu    sync.Mutex
+	firstErr error
+}
+
+// New creates a workload scheduler.
+func New(dgraph *cluster.DgraphClient, gql *graphql.Client, collector *metrics.Collector, cfg Config) *Scheduler {
+	if cfg.WriteConcurrency < 1 {
+		cfg.WriteConcurrency = 8
+	}
+	if cfg.ReadConcurrency < 1 {
+		cfg.ReadConcurrency = 8
+	}
+	return &Scheduler{dgraph: dgraph, gql: gql, collector: collector, cfg: cfg}
+}
+
+// Run executes write passes and read load concurrently until the deadline,
+// always completing any in-flight write pass (completeness wins), then runs a
+// finalize pass to pin the deterministic end state. Returns the first error
+// seen in strict mode.
+func (s *Scheduler) Run(ctx context.Context, deadline time.Time) error {
+	ctx, s.cancel = context.WithCancel(ctx)
+	defer s.cancel()
+
+	// Readers run for the whole duration of the write loop.
+	readCtx, cancelReaders := context.WithCancel(ctx)
+	var readers sync.WaitGroup
+	for i := 0; i < s.cfg.ReadConcurrency; i++ {
+		readers.Add(1)
+		go func(id int) {
+			defer readers.Done()
+			s.readLoop(readCtx, id)
+		}(i)
+	}
+
+	passes := 0
+	for passes == 0 || time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			break
+		}
+		slog.Info("write pass starting", "pass", passes+1)
+		s.WritePass(ctx, s.cfg.WriteConcurrency, timedWriteAttempts)
+		passes++
+		slog.Info("write pass complete", "pass", passes)
+	}
+
+	cancelReaders()
+	readers.Wait()
+
+	slog.Info("running finalize pass (serial, guarantees deterministic end state)")
+	s.Finalize(ctx)
+
+	// In non-strict mode, transient conflicts are retried and the serial
+	// finalize pass guarantees correctness, so validation (not a logged op
+	// error) decides success. Strict mode surfaces the first error.
+	if s.cfg.Strict {
+		return s.Err()
+	}
+	return nil
+}
+
+// WritePass applies one full deterministic write pass at the given concurrency,
+// retrying each write up to `attempts` times on transaction conflict. Stages run
+// sequentially (create-before-link ordering); work within a stage is fanned out
+// across `conc` workers.
+func (s *Scheduler) WritePass(ctx context.Context, conc, attempts int) {
+	d := s.cfg.Dataset
+
+	// Stage 1: categories and companies (referenced by later stages).
+	stage1 := make([]task, 0, d.NumCategories+d.NumCompanies)
+	for i := 0; i < d.NumCategories; i++ {
+		c := d.Category(i)
+		stage1 = append(stage1, func(ctx context.Context) { s.gqlWrite(ctx, "category", testdata.AddCategory(c), attempts) })
+	}
+	for i := 0; i < d.NumCompanies; i++ {
+		c := d.Company(i)
+		stage1 = append(stage1, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLWrite, "company", testdata.CompanyUpsert(c), attempts) })
+	}
+	runPool(ctx, conc, stage1)
+
+	// Stage 2: persons, products, posts, reviews — mixed DQL+GraphQL load.
+	stage2 := make([]task, 0, d.NumPersons+d.NumProducts+d.NumPosts+d.NumProducts*d.ReviewsPerProduct)
+	for i := 0; i < d.NumPersons; i++ {
+		p := d.Person(i)
+		stage2 = append(stage2, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLWrite, "person", testdata.PersonUpsert(p), attempts) })
+	}
+	for i := 0; i < d.NumProducts; i++ {
+		p := d.Product(i)
+		stage2 = append(stage2, func(ctx context.Context) { s.gqlWrite(ctx, "product", testdata.AddProduct(p), attempts) })
+	}
+	for i := 0; i < d.NumPosts; i++ {
+		p := d.Post(i)
+		stage2 = append(stage2, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLWrite, "post", testdata.PostUpsert(p), attempts) })
+	}
+	for i := 0; i < d.NumProducts; i++ {
+		for j := 0; j < d.ReviewsPerProduct; j++ {
+			r := d.Review(i, j)
+			stage2 = append(stage2, func(ctx context.Context) { s.gqlWrite(ctx, "review", testdata.AddReview(r), attempts) })
+		}
+	}
+	runPool(ctx, conc, stage2)
+
+	// Stage 3: ephemeral churn — create then delete, exercising the delete path.
+	stage3 := make([]task, 0, d.NumEphPersons+d.NumEphProducts)
+	for i := 0; i < d.NumEphPersons; i++ {
+		p := d.EphPerson(i)
+		stage3 = append(stage3, func(ctx context.Context) {
+			s.dqlWrite(ctx, metrics.OpDQLWrite, "eph-person", testdata.PersonUpsert(p), attempts)
+			s.dqlWrite(ctx, metrics.OpDQLDelete, "eph-person", testdata.DeleteByXid(p.Xid), attempts)
+		})
+	}
+	for i := 0; i < d.NumEphProducts; i++ {
+		p := d.EphProduct(i)
+		stage3 = append(stage3, func(ctx context.Context) {
+			s.gqlWrite(ctx, "eph-product", testdata.AddProduct(p), attempts)
+			s.gqlDelete(ctx, "eph-product", testdata.DeleteProduct(p.SKU), attempts)
+		})
+	}
+	runPool(ctx, conc, stage3)
+}
+
+// Finalize guarantees the deterministic end state. It runs serially (no
+// concurrent writers => no transaction conflicts) with a generous retry budget,
+// re-applying every persistent record and deleting every ephemeral record. All
+// operations are idempotent, so this converges regardless of mid-run churn.
+func (s *Scheduler) Finalize(ctx context.Context) {
+	d := s.cfg.Dataset
+
+	// Serial full pass pins every persistent record's values and edges.
+	s.WritePass(ctx, 1, finalizeWriteAttempts)
+
+	// Explicitly delete every ephemeral key in case the churn above was
+	// interrupted between create and delete.
+	dels := make([]task, 0, d.NumEphPersons+d.NumEphProducts)
+	for i := 0; i < d.NumEphPersons; i++ {
+		xid := d.EphPerson(i).Xid
+		dels = append(dels, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLDelete, "eph-person", testdata.DeleteByXid(xid), finalizeWriteAttempts) })
+	}
+	for i := 0; i < d.NumEphProducts; i++ {
+		sku := d.EphProduct(i).SKU
+		dels = append(dels, func(ctx context.Context) { s.gqlDelete(ctx, "eph-product", testdata.DeleteProduct(sku), finalizeWriteAttempts) })
+	}
+	runPool(ctx, 1, dels)
+}
+
+func (s *Scheduler) readLoop(ctx context.Context, id int) {
+	dqlQs := queries.DQLQueries()
+	gqlQs := queries.GraphQLQueries()
+	for i := id; ctx.Err() == nil; i++ {
+		if i%2 == 0 {
+			q := dqlQs[(i/2)%len(dqlQs)]
+			s.dqlQuery(ctx, q)
+		} else {
+			q := gqlQs[(i/2)%len(gqlQs)]
+			s.gqlQuery(ctx, q)
+		}
+	}
+}
+
+// --- execution + metrics ---
+
+func (s *Scheduler) dqlWrite(ctx context.Context, opType, label string, req *api.Request, attempts int) {
+	start := time.Now()
+	var resp *api.Response
+	var err error
+	for a := 0; a < attempts; a++ {
+		txn := s.dgraph.Txn()
+		resp, err = txn.Do(ctx, req)
+		txn.Discard(ctx)
+		if err == nil || ctx.Err() != nil || !isConflict(err) {
+			break
+		}
+		backoff(a)
+	}
+	s.observe(opType+":"+label, time.Since(start), dqlServerNs(resp), dqlTouched(resp), err)
+	s.onErr(opType+":"+label, err)
+}
+
+func (s *Scheduler) dqlQuery(ctx context.Context, q queries.DQLQuery) {
+	start := time.Now()
+	txn := s.dgraph.ReadOnlyTxn()
+	defer txn.Discard(ctx)
+	var resp *api.Response
+	var err error
+	if len(q.Vars) > 0 {
+		resp, err = txn.QueryWithVars(ctx, q.Query, q.Vars)
+	} else {
+		resp, err = txn.Query(ctx, q.Query)
+	}
+	s.observe(metrics.OpDQLQuery+":"+q.Label, time.Since(start), dqlServerNs(resp), dqlTouched(resp), err)
+	s.onErr("dql-query:"+q.Label, err)
+}
+
+func (s *Scheduler) gqlWrite(ctx context.Context, label string, m testdata.GraphQLMutation, attempts int) {
+	s.gqlExec(ctx, metrics.OpGQLWrite+":"+label, m.Query, m.Vars, attempts)
+}
+
+func (s *Scheduler) gqlDelete(ctx context.Context, label string, m testdata.GraphQLMutation, attempts int) {
+	s.gqlExec(ctx, metrics.OpGQLDelete+":"+label, m.Query, m.Vars, attempts)
+}
+
+func (s *Scheduler) gqlQuery(ctx context.Context, q queries.GraphQLQuery) {
+	s.gqlExec(ctx, metrics.OpGQLQuery+":"+q.Label, q.Query, q.Vars, 1)
+}
+
+func (s *Scheduler) gqlExec(ctx context.Context, key, query string, vars map[string]interface{}, attempts int) {
+	start := time.Now()
+	var resp *graphql.Response
+	var err error
+	for a := 0; a < attempts; a++ {
+		resp, err = s.gql.Query(ctx, query, vars)
+		if err == nil && resp != nil && len(resp.Errors) > 0 {
+			err = fmt.Errorf("graphql: %s", resp.Errors[0].Message)
+		}
+		if err == nil || ctx.Err() != nil || !isConflict(err) {
+			break
+		}
+		backoff(a)
+	}
+	d := time.Since(start)
+	var serverNs, touched uint64
+	if resp != nil && resp.Extensions != nil {
+		touched = resp.Extensions.TouchedUids
+		if resp.Extensions.Tracing != nil {
+			serverNs = uint64(resp.Extensions.Tracing.Duration)
+		}
+	}
+	s.observe(key, d, serverNs, touched, err)
+	s.onErr(key, err)
+}
+
+func (s *Scheduler) observe(key string, d time.Duration, serverNs, touched uint64, err error) {
+	s.collector.Observe(key, d, serverNs, touched, err == nil)
+}
+
+func (s *Scheduler) onErr(op string, err error) {
+	if err == nil {
+		return
+	}
+	slog.Debug("operation error", "op", op, "err", err)
+	s.errMu.Lock()
+	if s.firstErr == nil {
+		s.firstErr = fmt.Errorf("%s: %w", op, err)
+	}
+	s.errMu.Unlock()
+	if s.cfg.Strict {
+		s.cancel()
+	}
+}
+
+// Err returns the first error observed (nil if none).
+func (s *Scheduler) Err() error {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	return s.firstErr
+}
+
+// isConflict reports whether err is a retryable transaction conflict/abort.
+func isConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "aborted") ||
+		strings.Contains(msg, "conflict") ||
+		strings.Contains(msg, "please retry")
+}
+
+// backoff sleeps a short, attempt-scaled interval between retries.
+func backoff(attempt int) {
+	d := time.Duration(attempt+1) * 3 * time.Millisecond
+	if d > 60*time.Millisecond {
+		d = 60 * time.Millisecond
+	}
+	time.Sleep(d)
+}
+
+func dqlServerNs(resp *api.Response) uint64 {
+	if resp != nil && resp.Latency != nil {
+		return resp.Latency.TotalNs
+	}
+	return 0
+}
+
+func dqlTouched(resp *api.Response) uint64 {
+	if resp == nil || resp.Metrics == nil {
+		return 0
+	}
+	var sum uint64
+	for _, v := range resp.Metrics.NumUids {
+		sum += v
+	}
+	return sum
+}
+
+// --- worker pool ---
+
+type task func(context.Context)
+
+// runPool runs tasks across conc workers. It does not abort on the time budget
+// (callers govern whether to start a pass); it stops dispatching only on hard
+// context cancellation (e.g. SIGINT or strict-mode failure).
+func runPool(ctx context.Context, conc int, tasks []task) {
+	if conc < 1 {
+		conc = 1
+	}
+	ch := make(chan task)
+	var wg sync.WaitGroup
+	for i := 0; i < conc; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for t := range ch {
+				if ctx.Err() != nil {
+					continue // drain without executing once cancelled
+				}
+				t(ctx)
+			}
+		}()
+	}
+	for _, t := range tasks {
+		if ctx.Err() != nil {
+			break
+		}
+		ch <- t
+	}
+	close(ch)
+	wg.Wait()
+}

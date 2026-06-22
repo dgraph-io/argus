@@ -3,7 +3,15 @@
     "allow": [
       "Bash(find /Users/matthew/code/dgo -type f \\\\\\( -name \"*.proto\" -o -name \"*.go\" \\\\\\) | head -30)",
       "Read(//Users/matthew/code/dgo/**)",
-      "Bash(sed -n '/^message Operation/,/^}/p' /Users/matthew/code/dgo/protos/api.proto)"
+      "Bash(sed -n '/^message Operation/,/^}/p' /Users/matthew/code/dgo/protos/api.proto)",
+      "Bash(find /Users/matthew/code/dgraph -type f -name \"*.go\" | grep -i graphql | head -20)",
+      "Read(//Users/matthew/code/dgraph/**)",
+      "Bash(/Users/matthew/go/bin/dgraph zero *)",
+      "Bash(echo \"zero started, pid $!\")",
+      "Bash(/Users/matthew/code/argus/bin/argus -small -duration 12s -flush-interval 3s -write-concurrency 8 -read-concurrency 6 -ops-output /tmp/argus-ops.csv -runtime-output /tmp/argus-runtime.csv)",
+      "Bash(/Users/matthew/code/argus/bin/argus -small -duration 12s -flush-interval 3s -ops-output /tmp/run1-ops.csv -runtime-output /tmp/run1-runtime.csv)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(/Users/matthew/code/argus/bin/argus -small -duration 12s -flush-interval 3s -ops-output /tmp/run2-ops.csv -runtime-output /tmp/run2-runtime.csv)"
     ],
     "additionalDirectories": [
       "/Users/matthew/code/dgo/protos"

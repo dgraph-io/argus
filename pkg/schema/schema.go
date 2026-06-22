@@ -1,63 +1,132 @@
+// Package schema holds the test schemas Argus applies to a cluster.
+//
+// To exercise GraphQL and DQL in a single graph without predicate collisions,
+// the two schemas use disjoint type/predicate namespaces:
+//
+//   - DQL uses a social domain (Person, Company, Post, Tag, Comment) with bare
+//     predicates (name, email, friends, ...).
+//   - GraphQL uses a product-catalog domain (Product, Category, Review). Dgraph
+//     auto-generates Type.field predicates (Product.name, ...) for these, so
+//     they never clash with the DQL predicates above.
 package schema
 
-// GetTestSchema returns the test schema covering diverse Dgraph features.
-func GetTestSchema() string {
+// DQLSchema returns the DQL schema covering diverse Dgraph features:
+// scalar types, lists, uid edges, reverse edges, and a range of indexes
+// (exact, hash, term, fulltext, trigram, int, datetime, geo).
+func DQLSchema() string {
 	return `
 type Person {
-  name: String
-  email: String
-  age: Int
-  friends: [Person]
-  company: Company
-  bio: String @index(fulltext)
-  created_at: DateTime
+  xid
+  name
+  email
+  age
+  score
+  active
+  bio
+  tags_csv
+  location
+  created_at
+  friends
+  company
 }
 
 type Company {
-  name: String
-  domain: String
-  employees: [Person]
-  founded: DateTime
+  xid
+  name
+  domain
+  founded
+  employees
 }
 
 type Post {
-  title: String @index(fulltext)
-  content: String
-  author: Person
-  tags: [Tag]
-  likes: Int
-  created_at: DateTime
+  xid
+  title
+  content
+  likes
+  created_at
+  author
+  topics
 }
 
 type Tag {
-  name: String @index(exact)
-  posts: [Post]
+  tag_name
+  posts
 }
 
 type Comment {
-  text: String
-  author: Person
-  post: Post
-  created_at: DateTime
+  text
+  created_at
+  comment_author
+  comment_post
 }
 
-# Predicates with various indexes and types
-name: string @index(exact, fulltext) .
-email: string @index(exact) .
+xid: string @index(exact) @upsert .
+name: string @index(exact, term, fulltext) @lang .
+email: string @index(hash, trigram) @upsert .
 age: int @index(int) .
-friends: [uid] @reverse .
+score: float @index(float) .
+active: bool @index(bool) .
+bio: string @index(fulltext, trigram) .
+tags_csv: [string] @index(exact) .
+location: geo @index(geo) .
+created_at: datetime @index(hour) .
+friends: [uid] @reverse @count .
 company: uid @reverse .
-bio: string @index(fulltext) .
-created_at: datetime @index(day) .
 domain: string @index(exact) .
-employees: [uid] @reverse .
 founded: datetime .
-title: string @index(fulltext) .
-content: string .
-author: uid @reverse .
-tags: [uid] @reverse .
+employees: [uid] @reverse .
+title: string @index(fulltext, term) .
+content: string @index(fulltext) .
 likes: int @index(int) .
-text: string .
-post: uid @reverse .
+author: uid @reverse .
+topics: [uid] @reverse .
+tag_name: string @index(exact) @upsert .
+posts: [uid] @reverse .
+text: string @index(fulltext) .
+comment_author: uid @reverse .
+comment_post: uid @reverse .
+`
+}
+
+// GraphQLSchema returns the GraphQL SDL covering @id, @search (multiple index
+// kinds), @hasInverse bidirectional edges, enums, and scalar variety.
+func GraphQLSchema() string {
+	return `
+enum Availability {
+  IN_STOCK
+  OUT_OF_STOCK
+  DISCONTINUED
+}
+
+type Category {
+  id: ID!
+  slug: String! @id
+  name: String! @search(by: [term])
+  products: [Product] @hasInverse(field: category)
+}
+
+type Product {
+  id: ID!
+  sku: String! @id
+  name: String! @search(by: [term, fulltext])
+  description: String @search(by: [fulltext])
+  price: Float! @search
+  availability: Availability! @search
+  rating: Float @search
+  createdAt: DateTime! @search
+  category: Category
+  reviews: [Review] @hasInverse(field: product)
+}
+
+type Review {
+  id: ID!
+  key: String! @id
+  title: String! @search(by: [fulltext])
+  body: String @search(by: [fulltext])
+  stars: Int! @search
+  reviewer: String! @search(by: [hash])
+  createdAt: DateTime! @search
+  product: Product
+}
 `
 }

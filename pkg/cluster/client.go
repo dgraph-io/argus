@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"fmt"
-	"log/slog"
 
 	"github.com/dgraph-io/dgo/v250"
 	"github.com/dgraph-io/dgo/v250/protos/api"
@@ -38,27 +37,16 @@ func NewDgraphClient(ctx context.Context, addr string) (*DgraphClient, error) {
 	return dc, nil
 }
 
-// Health performs a basic health check by executing a simple query.
+// Health performs a basic health check by executing a trivial valid query.
+// Querying a (possibly nonexistent) type returns an empty result rather than
+// an error, which is all we need to confirm the gRPC endpoint is responsive.
 func (c *DgraphClient) Health(ctx context.Context) error {
-	query := `{ q(func: has(uid)) { uid } }`
+	query := `{ q(func: type(ArgusHealthProbe), first: 1) { uid } }`
 	_, err := c.Client.NewReadOnlyTxn().Query(ctx, query)
 	if err != nil {
 		return fmt.Errorf("health check query failed: %w", err)
 	}
 	return nil
-}
-
-// Version retrieves the Dgraph cluster version.
-func (c *DgraphClient) Version(ctx context.Context) (string, error) {
-	// Query a simple predicate to ensure cluster is responsive
-	// Version info would typically be in gRPC headers from the cluster
-	_, err := c.Client.NewReadOnlyTxn().Query(ctx, `{ q(func: has(uid)) { uid } }`)
-	if err != nil {
-		return "", fmt.Errorf("failed to query cluster: %w", err)
-	}
-	// Return a placeholder version; in production, parse from cluster headers
-	slog.Debug("version query executed")
-	return "unknown", nil
 }
 
 // ApplySchema applies a schema to the cluster.
