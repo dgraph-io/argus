@@ -132,5 +132,72 @@ func DQLQueries() []DQLQuery {
 			Query: `query q($a: int) { q(func: eq(age, $a), first: 25) { uid name age } }`,
 			Vars:  map[string]string{"$a": "30"},
 		},
+		{
+			Label: "allofterms-name",
+			Query: `{ q(func: allofterms(name, "Alice"), first: 50) { uid name } }`,
+		},
+		{
+			Label: "anyoftext-bio",
+			Query: `{ q(func: anyoftext(bio, "engineer scientist designer")) { uid bio } }`,
+		},
+		{
+			Label: "match-fuzzy-bio",
+			Query: `{ q(func: match(bio, "enginer", 8), first: 50) { uid bio } }`,
+		},
+		{
+			Label: "has-friends",
+			Query: `{ q(func: has(friends), first: 50) { uid } }`,
+		},
+		{
+			Label: "lt-age",
+			Query: `{ q(func: lt(age, 25)) { uid age } }`,
+		},
+		{
+			Label: "between-age",
+			Query: `{ q(func: between(age, 30, 40)) { uid age } }`,
+		},
+		{
+			Label: "sum-aggregate",
+			Query: `{ var(func: type(Person)) { a as age } q() { total_age: sum(val(a)) } }`,
+		},
+		{
+			Label: "uid-in-company",
+			Query: `{
+				c as var(func: eq(xid, "company-0"))
+				q(func: type(Person)) @filter(uid_in(company, uid(c))) { uid name }
+			}`,
+		},
+		{
+			Label: "filter-or",
+			Query: `{ q(func: type(Person)) @filter(eq(age, 30) OR eq(age, 31)) { uid age } }`,
+		},
+		{
+			Label: "filter-not-active",
+			Query: `{ q(func: type(Person)) @filter(NOT eq(active, true)) { uid active } }`,
+		},
+		{
+			Label: "order-asc-age",
+			Query: `{ q(func: type(Person), orderasc: age, first: 20) { uid age } }`,
+		},
+		{
+			Label: "expand-all",
+			Query: `{ q(func: eq(xid, "person-0")) { expand(_all_) } }`,
+		},
+		{
+			Label: "normalize-projection",
+			Query: `{ q(func: type(Person), first: 25) @normalize { person_name: name person_age: age } }`,
+		},
+		{
+			Label: "math-rich",
+			Query: `{
+				var(func: type(Person)) { s as score }
+				q(func: uid(s), first: 20) { score: val(s) derived: math(sqrt(s) + floor(s) + exp(0)) }
+			}`,
+		},
+		{
+			// Geo intersects: a polygon around the San Francisco cluster.
+			Label: "geo-intersects-hit",
+			Query: `{ q(func: intersects(location, [[[-122.5, 37.70], [-122.3, 37.70], [-122.3, 37.85], [-122.5, 37.85], [-122.5, 37.70]]])) { uid name } }`,
+		},
 	}
 }

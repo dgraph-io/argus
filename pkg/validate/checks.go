@@ -69,7 +69,74 @@ func (c *Checker) CheckAll(ctx context.Context) *Result {
 	c.checkShortest(ctx, add, 0, 150)
 	c.checkShortest(ctx, add, 0, 13)
 
+	// Exact results for assorted DQL functions, with the expected value
+	// computed by enumerating the deterministic generator.
+	c.checkFunctions(ctx, add)
+
 	return r
+}
+
+// checkFunctions asserts exact results for a spread of DQL functions whose
+// answers are computable from the deterministic dataset: has, lt, between, sum,
+// uid_in, allofterms, OR/NOT filters, orderasc, and geo intersects.
+func (c *Checker) checkFunctions(ctx context.Context, add func(string, bool, string)) {
+	d := c.data
+	var sumAge, lt25, between3040, company0, nameAlice, age3031, notActive int
+	minAge := int(^uint(0) >> 1) // max int
+	for i := 0; i < d.NumPersons; i++ {
+		p := d.Person(i)
+		sumAge += p.Age
+		if p.Age < 25 {
+			lt25++
+		}
+		if p.Age >= 30 && p.Age <= 40 {
+			between3040++
+		}
+		if i%d.NumCompanies == 0 {
+			company0++
+		}
+		if p.Name == "Alice" {
+			nameAlice++
+		}
+		if p.Age == 30 || p.Age == 31 {
+			age3031++
+		}
+		if !p.Active {
+			notActive++
+		}
+		if p.Age < minAge {
+			minAge = p.Age
+		}
+	}
+
+	countCheck := func(name, query string, want int) {
+		got, err := c.countQuery(ctx, query)
+		if err != nil {
+			add(name, false, err.Error())
+			return
+		}
+		add(name, got == want, fmt.Sprintf("want %d got %d", want, got))
+	}
+
+	countCheck("fn-has-bio", `{ q(func: has(bio)) { c: count(uid) } }`, d.NumPersons)
+	countCheck("fn-lt-age", `{ q(func: lt(age, 25)) { c: count(uid) } }`, lt25)
+	countCheck("fn-between-age", `{ q(func: between(age, 30, 40)) { c: count(uid) } }`, between3040)
+	countCheck("fn-sum-age", `{ var(func: type(Person)) { a as age } q() { c: sum(val(a)) } }`, sumAge)
+	countCheck("fn-uid-in-company",
+		`{ x as var(func: eq(xid, "company-0")) q(func: type(Person)) @filter(uid_in(company, uid(x))) { c: count(uid) } }`,
+		company0)
+	countCheck("fn-allofterms-name", `{ q(func: allofterms(name, "Alice")) { c: count(uid) } }`, nameAlice)
+	countCheck("fn-filter-or", `{ q(func: type(Person)) @filter(eq(age, 30) OR eq(age, 31)) { c: count(uid) } }`, age3031)
+	countCheck("fn-filter-not-active", `{ q(func: type(Person)) @filter(NOT eq(active, true)) { c: count(uid) } }`, notActive)
+	countCheck("fn-orderasc-min", `{ q(func: type(Person), orderasc: age, first: 1) { c: age } }`, minAge)
+
+	// Geo intersects over a polygon around cluster 0 returns exactly that cluster.
+	sf := testdata.GeoAnchors[0]
+	poly := fmt.Sprintf("[[[%g,%g],[%g,%g],[%g,%g],[%g,%g],[%g,%g]]]",
+		sf[0]-0.1, sf[1]-0.1, sf[0]+0.1, sf[1]-0.1, sf[0]+0.1, sf[1]+0.1, sf[0]-0.1, sf[1]+0.1, sf[0]-0.1, sf[1]-0.1)
+	countCheck("fn-geo-intersects",
+		fmt.Sprintf(`{ q(func: intersects(location, %s)) { c: count(uid) } }`, poly),
+		d.GeoClusterCount(0))
 }
 
 // cmp accumulates the outcome of a complete entity comparison.
