@@ -64,6 +64,10 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
+// Endpoint returns the /graphql HTTP URL, used to derive the WebSocket URL for
+// subscriptions.
+func (c *Client) Endpoint() string { return c.graphqlURL }
+
 // Query executes a GraphQL query against /graphql.
 func (c *Client) Query(ctx context.Context, query string, vars map[string]interface{}) (*Response, error) {
 	return c.do(ctx, c.graphqlURL, query, vars)

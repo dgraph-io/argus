@@ -132,5 +132,13 @@ type Review {
   createdAt: DateTime! @search
   product: Product
 }
+
+# Counter drives the WebSocket subscription latency benchmark. @withSubscription
+# enables getCounter/queryCounter subscriptions; the writer increments tick and
+# a subscriber measures commit-to-push propagation latency.
+type Counter @withSubscription {
+  id: String! @id
+  tick: Int! @search
+}
 `
 }

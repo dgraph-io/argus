@@ -14,6 +14,7 @@ import (
 	"github.com/dgraph-io/argus/pkg/metrics"
 	"github.com/dgraph-io/argus/pkg/output"
 	"github.com/dgraph-io/argus/pkg/schema"
+	"github.com/dgraph-io/argus/pkg/subscription"
 	"github.com/dgraph-io/argus/pkg/testdata"
 	"github.com/dgraph-io/argus/pkg/validate"
 	"github.com/dgraph-io/argus/pkg/workload"
@@ -67,6 +68,16 @@ func (o *Orchestrator) Run(ctx context.Context) (*validate.Result, error) {
 		o.flushLoop(flushCtx, start)
 	}()
 
+	// Subscription latency benchmark runs concurrently with the workload.
+	subCtx, stopSub := context.WithCancel(ctx)
+	subDone := make(chan struct{})
+	go func() {
+		defer close(subDone)
+		// Cadence ~ the server poll-interval (default 1s) yields the cleanest
+		// commit-to-push latency distribution.
+		subscription.New(o.gql, o.collector, time.Second).Run(subCtx)
+	}()
+
 	sched := workload.New(o.dgraph, o.gql, o.collector, workload.Config{
 		WriteConcurrency: o.opts.WriteConcurrency,
 		ReadConcurrency:  o.opts.ReadConcurrency,
@@ -76,6 +87,8 @@ func (o *Orchestrator) Run(ctx context.Context) (*validate.Result, error) {
 	slog.Info("workload starting", "duration", o.opts.Duration, "deadline", deadline.Format(time.RFC3339))
 	workloadErr := sched.Run(ctx, deadline)
 
+	stopSub()
+	<-subDone
 	stopFlush()
 	<-flushDone
 	o.flush(start) // final snapshot

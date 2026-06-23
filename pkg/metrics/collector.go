@@ -22,6 +22,7 @@ const (
 	OpGQLQuery  = "gql-query"
 	OpDQLLedger = "dql-ledger"
 	OpGQLLedger = "gql-ledger"
+	OpGQLSub    = "gql-sub"
 )
 
 type window struct {
