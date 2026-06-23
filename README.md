@@ -147,6 +147,11 @@ which would invalidate the comparison.
 set, making latency apples-to-apples; `-duration` (fixed time) is available for
 a throughput-over-a-window comparison.
 
+Runs are recorded in tiered folders under [results/](results/) — one per Dgraph
+version × hardware/config — each checking in a `docker-compose.yml`, a `run.sh`,
+and the `summary-*.json`. See [results/README.md](results/README.md) for the
+convention.
+
 ## Kubernetes / GKE
 
 argus must reach each alpha individually (to spread load and scrape per-node

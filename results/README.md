@@ -1,36 +1,49 @@
 # Results
 
-Benchmark runs are recorded in tiered folders:
+Benchmark runs are recorded in tiered folders — **Dgraph version**, then
+**hardware + cluster config**:
 
 ```
-results/<dgraph-version>/<hardware + cluster config>/
+results/
+└── v25.3.6/                                          # tier 1: Dgraph version
+    └── M4 - 64GB - 12core - 1 Zero 1 Alpha - Docker-compose/   # tier 2: hw + config
+        ├── README.md          # what this config is and how to reproduce it
+        ├── docker-compose.yml # the cluster definition
+        ├── run.sh             # the exact argus command (checked in)
+        ├── summary-1.json     # committed result (one per repeat)
+        └── summary-2.json
 ```
 
-e.g. `results/v25.3.6/M4 - 64GB - 12core - 1 Zero 1 Alpha - Docker-compose/`.
-The folder name captures everything that isn't the Dgraph version itself
-(machine, RAM, cores, topology, deployment) so two runs are only comparable when
-their folders match except for the version tier.
+The config-folder name encodes everything that isn't the version — machine, RAM,
+cores, topology (`1 Zero 1 Alpha`, `1 Zero 3 HA`, `3 group sharded`, …), and
+deployment (`Docker-compose`, `GKE`, …). Two runs are comparable only when their
+folders match in every tier **except** the version. A run also stamps these into
+the summary (`env`, `dataset`, `label`), and `argus compare` warns if they differ.
 
 ## Convention: each config folder is self-contained
 
-Every config folder checks in both the environment and the exact run:
+Every config folder checks in the environment, the exact run, and the result:
 
-- **`docker-compose.yml`** — defines the cluster (or a pointer to how it was
-  deployed, for GKE etc.).
+- **`README.md`** — one paragraph on what this config is, the run parameters, and
+  any caveats (e.g. "single alpha isolates the version; numbers are Docker-on-Mac
+  I/O bound, so use deltas not magnitudes").
+- **`docker-compose.yml`** — defines the cluster (or, for GKE, a pointer to the
+  deploy that produced it).
 - **`run.sh`** — the exact, reproducible argus command: builds argus, brings the
   cluster up, waits for health, runs with the right flags (incl. `-label`
-  matching the folder), and writes results into the same folder.
-- **`summary.json`** (and `summary-N.json` for repeats) — the machine-readable
-  result, used by `argus compare`. **This is the artifact to commit.**
+  matching the folder), writes results into the same folder. **Always record the
+  command here** so a run is reproducible from the checked-in repo alone.
+- **`summary-N.json`** — the machine-readable per-run result (one per repeat),
+  used by `argus compare`.
+- **`ops-N.csv` / `runtime-N.csv` / `cluster-N.csv`** — the per-interval
+  time-series (client throughput/latency, load-generator runtime, per-node
+  cluster metrics). Useful for plotting how a run behaved over time.
 
-So `git`-tracking a folder preserves how the cluster was built, how argus was
-run, and the summarized result.
-
-Note: `*.csv` is git-ignored, so the bulky per-interval `ops.csv` /
-`runtime.csv` / `cluster.csv` are kept locally but not committed; the
-`summary.json` (which carries the full-run percentiles + cluster steady-state)
-is what gets versioned. Add a `!results/**/*.csv` exception to `.gitignore` if
-you want the time-series committed too.
+**All of these are committed** — `summary-*.json` is the comparison unit, and
+the CSVs preserve the full time-series so a recorded run can be re-examined
+later without re-running it. `git`-tracking a config folder thus captures how
+the cluster was built (`docker-compose.yml`), how argus was run (`run.sh`), and
+the complete result (summaries + CSVs).
 
 ## Comparing versions
 
