@@ -124,6 +124,14 @@ func (s *Scheduler) WritePass(ctx context.Context, conc, attempts int, ledger bo
 		c := d.Company(i)
 		stage1 = append(stage1, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLWrite, "company", testdata.CompanyUpsert(c), attempts) })
 	}
+	for i := 0; i < d.NumDogs; i++ {
+		dog := d.Dog(i)
+		stage1 = append(stage1, func(ctx context.Context) { s.gqlWrite(ctx, "dog", testdata.AddDog(dog), attempts) })
+	}
+	for i := 0; i < d.NumCats; i++ {
+		cat := d.Cat(i)
+		stage1 = append(stage1, func(ctx context.Context) { s.gqlWrite(ctx, "cat", testdata.AddCat(cat), attempts) })
+	}
 	runPool(ctx, conc, stage1)
 
 	// Stage 2: persons, products, posts, reviews — mixed DQL+GraphQL load.
@@ -160,14 +168,23 @@ func (s *Scheduler) WritePass(ctx context.Context, conc, attempts int, ledger bo
 		stage2 = append(stage2, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLWrite, "post-bulk", r, attempts) })
 	}
 
+	// Products split by index: even indices are created with a deep mutation
+	// (product + reviews inline in one call); odd indices use a shallow add plus
+	// separate review adds. Both converge to the same graph.
 	for i := 0; i < d.NumProducts; i++ {
 		p := d.Product(i)
-		stage2 = append(stage2, func(ctx context.Context) { s.gqlWrite(ctx, "product", testdata.AddProduct(p), attempts) })
-	}
-	for i := 0; i < d.NumProducts; i++ {
-		for j := 0; j < d.ReviewsPerProduct; j++ {
-			r := d.Review(i, j)
-			stage2 = append(stage2, func(ctx context.Context) { s.gqlWrite(ctx, "review", testdata.AddReview(r), attempts) })
+		if i%2 == 0 {
+			reviews := make([]testdata.Review, d.ReviewsPerProduct)
+			for j := range reviews {
+				reviews[j] = d.Review(i, j)
+			}
+			stage2 = append(stage2, func(ctx context.Context) { s.gqlWrite(ctx, "product-deep", testdata.AddProductDeep(p, reviews), attempts) })
+		} else {
+			stage2 = append(stage2, func(ctx context.Context) { s.gqlWrite(ctx, "product", testdata.AddProduct(p), attempts) })
+			for j := 0; j < d.ReviewsPerProduct; j++ {
+				r := d.Review(i, j)
+				stage2 = append(stage2, func(ctx context.Context) { s.gqlWrite(ctx, "review", testdata.AddReview(r), attempts) })
+			}
 		}
 	}
 	runPool(ctx, conc, stage2)
@@ -215,9 +232,21 @@ func (s *Scheduler) WritePass(ctx context.Context, conc, attempts int, ledger bo
 			s.rmwPrice(ctx, sku, delta)
 			s.rmwPrice(ctx, sku, -delta)
 		})
+		// Exercise updateX set+remove on a transient note for a ~10% subset. The
+		// note is never part of the canonical product, so the finalize remove
+		// (and the complete check expecting it absent) verifies remove works.
+		if i%10 == 0 {
+			note := noteValue(i)
+			ledgerTasks = append(ledgerTasks, func(ctx context.Context) {
+				s.gqlWrite(ctx, "set-note", testdata.SetProductNote(sku, note), attempts)
+				s.gqlWrite(ctx, "remove-note", testdata.RemoveProductNote(sku, note), attempts)
+			})
+		}
 	}
 	runPool(ctx, conc, ledgerTasks)
 }
+
+func noteValue(i int) string { return fmt.Sprintf("note-%d", i) }
 
 // Finalize guarantees the deterministic end state. It runs serially (no
 // concurrent writers => no transaction conflicts) with a generous retry budget,
@@ -240,6 +269,14 @@ func (s *Scheduler) Finalize(ctx context.Context) {
 	for i := 0; i < d.NumEphProducts; i++ {
 		sku := d.EphProduct(i).SKU
 		dels = append(dels, func(ctx context.Context) { s.gqlDelete(ctx, "eph-product", testdata.DeleteProduct(sku), finalizeWriteAttempts) })
+	}
+	// Guarantee the transient note is cleared from every product that the timed
+	// phase may have set it on, so the canonical end state has no note.
+	for i := 0; i < d.NumProducts; i++ {
+		if i%10 == 0 {
+			sku, note := d.Product(i).SKU, noteValue(i)
+			dels = append(dels, func(ctx context.Context) { s.gqlWrite(ctx, "remove-note", testdata.RemoveProductNote(sku, note), finalizeWriteAttempts) })
+		}
 	}
 	runPool(ctx, 1, dels)
 }

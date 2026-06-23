@@ -68,5 +68,57 @@ func GraphQLQueries() []GraphQLQuery {
 				}
 			}`,
 		},
+		{
+			Label: "filter-and",
+			Query: `query { queryProduct(filter: { and: [{ price: { ge: 50 } }, { availability: { eq: IN_STOCK } }] }) { sku } }`,
+		},
+		{
+			Label: "filter-or-not",
+			Query: `query { queryProduct(filter: { or: [{ availability: { eq: DISCONTINUED } }, { not: { rating: { ge: 1 } } }] }) { sku } }`,
+		},
+		{
+			Label: "filter-in",
+			Query: `query { queryProduct(filter: { availability: { in: [IN_STOCK, DISCONTINUED] } }) { sku } }`,
+		},
+		{
+			Label: "filter-has",
+			Query: `query { queryProduct(filter: { has: rating }) { sku } }`,
+		},
+		{
+			Label: "filter-regexp",
+			Query: `query { queryProduct(filter: { name: { regexp: "/^Product 1.*/" } }) { sku name } }`,
+		},
+		{
+			Label: "cascade",
+			Query: `query { queryProduct(first: 50) @cascade { sku category { slug } } }`,
+		},
+		{
+			Label: "nested-filter",
+			Query: `query { queryProduct(first: 20) { sku reviews(filter: { stars: { ge: 4 } }) { stars } } }`,
+		},
+		{
+			Label: "aggregate-sum",
+			Query: `query { aggregateProduct { count priceSum priceMin priceMax } }`,
+		},
+		{
+			Label: "introspection-typename",
+			Query: `query { __typename queryProduct(first: 1) { __typename sku } }`,
+		},
+		{
+			Label: "introspection-type",
+			Query: `query { __type(name: "Product") { name kind fields { name } } }`,
+		},
+		{
+			Label: "interface-query-fragments",
+			Query: `query { queryAnimal { xid name __typename ... on Dog { goodBoy } ... on Cat { lives } } }`,
+		},
+		{
+			Label: "interop-get-personview",
+			Query: `query { getPersonView(pxid: "person-0") { pxid pname age bio } }`,
+		},
+		{
+			Label: "interop-aggregate-personview",
+			Query: `query { aggregatePersonView { count } }`,
+		},
 	}
 }

@@ -104,15 +104,19 @@ func (o *Orchestrator) Run(ctx context.Context) (*validate.Result, error) {
 }
 
 func (o *Orchestrator) setup(ctx context.Context) error {
-	slog.Info("applying DQL schema")
-	if err := o.dgraph.ApplySchema(ctx, schema.DQLSchema()); err != nil {
-		return fmt.Errorf("apply DQL schema: %w", err)
-	}
+	// GraphQL schema first, then DQL. The interop type PersonView maps onto the
+	// DQL Person predicates (xid/name/age/bio); applying the DQL Alter last makes
+	// it authoritative for those shared predicates, so updateGQLSchema cannot
+	// strip their indexes / @upsert / @lang.
 	slog.Info("applying GraphQL schema")
 	if err := o.gql.UpdateSchema(ctx, schema.GraphQLSchema()); err != nil {
 		return fmt.Errorf("apply GraphQL schema: %w", err)
 	}
-	// Give the cluster a moment to propagate the GraphQL schema before writes.
+	slog.Info("applying DQL schema")
+	if err := o.dgraph.ApplySchema(ctx, schema.DQLSchema()); err != nil {
+		return fmt.Errorf("apply DQL schema: %w", err)
+	}
+	// Give the cluster a moment to propagate the schema before writes.
 	select {
 	case <-ctx.Done():
 		return ctx.Err()

@@ -80,7 +80,215 @@ func (c *Checker) CheckAll(ctx context.Context) *Result {
 	c.checkNgram(ctx, add)
 	c.checkContains(ctx, add)
 
+	// GraphQL feature coverage: filters, aggregation, introspection, interface,
+	// and @dgraph interop.
+	c.checkGraphQLFilters(ctx, add)
+	c.checkIntrospection(ctx, add)
+	c.checkInterface(ctx, add)
+	c.checkInterop(ctx, add)
+
 	return r
+}
+
+// checkGraphQLFilters asserts exact results for GraphQL filter combinators,
+// `in`, `has`, `regexp`, and aggregate `sum`, with expected values computed by
+// enumerating the deterministic product set.
+func (c *Checker) checkGraphQLFilters(ctx context.Context, add func(string, bool, string)) {
+	d := c.data
+	var andCount, inCount, regexpCount, orNotCount int
+	var priceSum float64
+	for i := 0; i < d.NumProducts; i++ {
+		p := d.Product(i)
+		priceSum += p.Price
+		if p.Price >= 50 && p.Availability == "IN_STOCK" {
+			andCount++
+		}
+		if p.Availability == "IN_STOCK" || p.Availability == "DISCONTINUED" {
+			inCount++
+		}
+		if strings.HasPrefix(p.Name, "Product 1") {
+			regexpCount++
+		}
+		if p.Availability == "DISCONTINUED" || p.Rating < 1 {
+			orNotCount++
+		}
+	}
+
+	pc := func(name, filter string, want int) {
+		got, err := c.gqlProductCount(ctx, filter)
+		if err != nil {
+			add(name, false, err.Error())
+			return
+		}
+		add(name, got == want, fmt.Sprintf("want %d got %d", want, got))
+	}
+	pc("gql-filter-and", `{ and: [{ price: { ge: 50 } }, { availability: { eq: IN_STOCK } }] }`, andCount)
+	pc("gql-filter-in", `{ availability: { in: [IN_STOCK, DISCONTINUED] } }`, inCount)
+	pc("gql-filter-has", `{ has: rating }`, d.NumProducts)
+	pc("gql-filter-regexp", `{ name: { regexp: "/^Product 1.*/" } }`, regexpCount)
+	pc("gql-filter-or-not", `{ or: [{ availability: { eq: DISCONTINUED } }, { not: { rating: { ge: 1 } } }] }`, orNotCount)
+
+	// aggregate sum (float, tolerant compare).
+	sum, err := c.gqlProductPriceSum(ctx)
+	if err != nil {
+		add("gql-aggregate-sum", false, err.Error())
+	} else {
+		add("gql-aggregate-sum", floatEq(sum, priceSum) || (priceSum != 0 && math.Abs(sum-priceSum)/priceSum < 1e-6),
+			fmt.Sprintf("want %.2f got %.2f", priceSum, sum))
+	}
+}
+
+// checkIntrospection confirms schema introspection returns the Product type
+// with its expected fields, and __typename resolves.
+func (c *Checker) checkIntrospection(ctx context.Context, add func(string, bool, string)) {
+	resp, err := c.gql.Query(ctx, `{ __type(name: "Product") { name fields { name } } }`, nil)
+	if err != nil {
+		add("gql-introspection", false, err.Error())
+		return
+	}
+	var out struct {
+		Type *struct {
+			Name   string `json:"name"`
+			Fields []struct {
+				Name string `json:"name"`
+			} `json:"fields"`
+		} `json:"__type"`
+	}
+	if err := json.Unmarshal(resp.Data, &out); err != nil || out.Type == nil {
+		add("gql-introspection", false, "no __type result")
+		return
+	}
+	have := map[string]bool{}
+	for _, f := range out.Type.Fields {
+		have[f.Name] = true
+	}
+	ok := out.Type.Name == "Product" && have["sku"] && have["price"] && have["note"] && have["reviews"]
+	add("gql-introspection", ok, fmt.Sprintf("type=%s fields=%d", out.Type.Name, len(out.Type.Fields)))
+}
+
+// checkInterface verifies queryAnimal returns every Dog and Cat (interface
+// query) and that inline fragments expose the concrete-type fields.
+func (c *Checker) checkInterface(ctx context.Context, add func(string, bool, string)) {
+	resp, err := c.gql.Query(ctx, `query {
+		queryAnimal { xid name __typename ... on Dog { goodBoy } ... on Cat { lives } }
+	}`, nil)
+	if err != nil {
+		add("gql-interface", false, err.Error())
+		return
+	}
+	if len(resp.Errors) > 0 {
+		add("gql-interface", false, resp.Errors[0].Message)
+		return
+	}
+	var out struct {
+		QueryAnimal []struct {
+			Xid      string `json:"xid"`
+			Typename string `json:"__typename"`
+			GoodBoy  *bool  `json:"goodBoy"`
+			Lives    *int   `json:"lives"`
+		} `json:"queryAnimal"`
+	}
+	if err := json.Unmarshal(resp.Data, &out); err != nil {
+		add("gql-interface", false, err.Error())
+		return
+	}
+	dogs, cats := 0, 0
+	for _, a := range out.QueryAnimal {
+		switch a.Typename {
+		case "Dog":
+			if a.GoodBoy != nil {
+				dogs++
+			}
+		case "Cat":
+			if a.Lives != nil {
+				cats++
+			}
+		}
+	}
+	ok := dogs == c.data.NumDogs && cats == c.data.NumCats
+	add("gql-interface", ok, fmt.Sprintf("dogs %d/%d cats %d/%d", dogs, c.data.NumDogs, cats, c.data.NumCats))
+}
+
+// checkInterop verifies the @dgraph-mapped PersonView reads DQL-written Person
+// data through GraphQL: aggregate count matches, and a keyed lookup returns the
+// generator's values.
+func (c *Checker) checkInterop(ctx context.Context, add func(string, bool, string)) {
+	// Aggregate count over the mapped type equals the DQL person count.
+	resp, err := c.gql.Query(ctx, `{ aggregatePersonView { count } }`, nil)
+	if err != nil {
+		add("gql-interop-count", false, err.Error())
+	} else {
+		var out struct {
+			Agg struct {
+				Count int `json:"count"`
+			} `json:"aggregatePersonView"`
+		}
+		if json.Unmarshal(resp.Data, &out) == nil {
+			add("gql-interop-count", out.Agg.Count == c.data.NumPersons, fmt.Sprintf("want %d got %d", c.data.NumPersons, out.Agg.Count))
+		} else {
+			add("gql-interop-count", false, "decode")
+		}
+	}
+
+	// Keyed lookup returns the same scalar values DQL wrote.
+	want := c.data.Person(0)
+	r2, err := c.gql.Query(ctx, `query($x: String!) { getPersonView(pxid: $x) { pname age bio } }`,
+		map[string]interface{}{"x": want.Xid})
+	if err != nil {
+		add("gql-interop-read", false, err.Error())
+		return
+	}
+	var out struct {
+		Get *struct {
+			Pname string `json:"pname"`
+			Age   int    `json:"age"`
+			Bio   string `json:"bio"`
+		} `json:"getPersonView"`
+	}
+	if err := json.Unmarshal(r2.Data, &out); err != nil || out.Get == nil {
+		add("gql-interop-read", false, "no getPersonView result")
+		return
+	}
+	ok := out.Get.Pname == want.Name && out.Get.Age == want.Age && out.Get.Bio == want.Bio
+	add("gql-interop-read", ok, fmt.Sprintf("name=%s/%s age=%d/%d", out.Get.Pname, want.Name, out.Get.Age, want.Age))
+}
+
+func (c *Checker) gqlProductCount(ctx context.Context, filter string) (int, error) {
+	resp, err := c.gql.Query(ctx, fmt.Sprintf(`query { aggregateProduct(filter: %s) { count } }`, filter), nil)
+	if err != nil {
+		return 0, err
+	}
+	if len(resp.Errors) > 0 {
+		return 0, fmt.Errorf("graphql: %s", resp.Errors[0].Message)
+	}
+	var out struct {
+		Agg struct {
+			Count int `json:"count"`
+		} `json:"aggregateProduct"`
+	}
+	if err := json.Unmarshal(resp.Data, &out); err != nil {
+		return 0, err
+	}
+	return out.Agg.Count, nil
+}
+
+func (c *Checker) gqlProductPriceSum(ctx context.Context) (float64, error) {
+	resp, err := c.gql.Query(ctx, `query { aggregateProduct { priceSum } }`, nil)
+	if err != nil {
+		return 0, err
+	}
+	if len(resp.Errors) > 0 {
+		return 0, fmt.Errorf("graphql: %s", resp.Errors[0].Message)
+	}
+	var out struct {
+		Agg struct {
+			PriceSum float64 `json:"priceSum"`
+		} `json:"aggregateProduct"`
+	}
+	if err := json.Unmarshal(resp.Data, &out); err != nil {
+		return 0, err
+	}
+	return out.Agg.PriceSum, nil
 }
 
 // checkVector validates similar_to functionally. The embedding *values*
@@ -487,6 +695,7 @@ type productNode struct {
 	SKU          string       `json:"sku"`
 	Name         string       `json:"name"`
 	Description  string       `json:"description"`
+	Note         *string      `json:"note"`
 	Price        float64      `json:"price"`
 	Availability string       `json:"availability"`
 	Rating       float64      `json:"rating"`
@@ -501,7 +710,7 @@ func (c *Checker) checkAllProducts(ctx context.Context, add func(string, bool, s
 	for offset := 0; ; offset += page {
 		q := fmt.Sprintf(`query {
 			queryProduct(first: %d, offset: %d) {
-				sku name description price availability rating createdAt
+				sku name description note price availability rating createdAt
 				category { slug }
 				reviews { key title body stars reviewer createdAt }
 			}
@@ -573,6 +782,8 @@ func (c *Checker) productDiff(idx int, w testdata.Product, g productNode) string
 		return "createdAt"
 	case g.Category == nil || g.Category.Slug != w.CategorySlug:
 		return "category"
+	case g.Note != nil && *g.Note != "":
+		return "note should be absent (updateX remove)"
 	}
 	// Reviews: exact key set and per-review fields.
 	if len(g.Reviews) != c.data.ReviewsPerProduct {

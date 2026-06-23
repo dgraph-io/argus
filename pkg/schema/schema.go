@@ -112,8 +112,9 @@ type Category {
 type Product {
   id: ID!
   sku: String! @id
-  name: String! @search(by: [term, fulltext])
+  name: String! @search(by: [term, fulltext, regexp])
   description: String @search(by: [fulltext])
+  note: String
   price: Float! @search
   availability: Availability! @search
   rating: Float @search
@@ -139,6 +140,32 @@ type Review {
 type Counter @withSubscription {
   id: String! @id
   tick: Int! @search
+}
+
+# Animal exercises GraphQL interface types: queryAnimal returns both Dog and Cat
+# nodes, and inline fragments select the concrete-type fields.
+interface Animal {
+  xid: String! @id
+  name: String! @search(by: [term])
+}
+
+type Dog implements Animal {
+  goodBoy: Boolean
+}
+
+type Cat implements Animal {
+  lives: Int
+}
+
+# PersonView exercises @dgraph interop: it maps onto the DQL Person type and
+# predicates, so GraphQL reads data written through DQL. Mapped fields omit
+# @search to avoid re-managing the indexes DQL already declares.
+type PersonView @dgraph(type: "Person") {
+  id: ID!
+  pxid: String! @id @dgraph(pred: "xid")
+  pname: String @dgraph(pred: "name")
+  age: Int @dgraph(pred: "age")
+  bio: String @dgraph(pred: "bio")
 }
 `
 }

@@ -108,6 +108,8 @@ type Dataset struct {
 	NumProducts       int // persistent products
 	NumEphProducts    int // ephemeral products (created then deleted)
 	ReviewsPerProduct int
+	NumDogs           int // Animal-interface members
+	NumCats           int
 }
 
 // DefaultDataset returns a corpus sized so a full write pass completes well
@@ -123,6 +125,8 @@ func DefaultDataset() Dataset {
 		NumProducts:       products,
 		NumEphProducts:    products / 20, // 5%
 		ReviewsPerProduct: 3,
+		NumDogs:           60,
+		NumCats:           40,
 	}
 }
 
@@ -139,6 +143,8 @@ func SmallDataset() Dataset {
 		NumProducts:       products,
 		NumEphProducts:    products / 20, // 5%
 		ReviewsPerProduct: 2,
+		NumDogs:           12,
+		NumCats:           8,
 	}
 }
 
@@ -370,6 +376,42 @@ func (d Dataset) Review(productIdx, j int) Review {
 		Reviewer:   firstNames[r.Intn(len(firstNames))],
 		CreatedAt:  baseTime.Add(time.Duration(productIdx) * time.Hour).Format(time.RFC3339),
 		ProductSKU: fmt.Sprintf("SKU-%d", productIdx),
+	}
+}
+
+// --- Animal interface records ---
+
+// Dog is a deterministic Dog (Animal interface) record.
+type Dog struct {
+	Xid     string
+	Name    string
+	GoodBoy bool
+}
+
+// Dog returns the dog at index i.
+func (d Dataset) Dog(i int) Dog {
+	r := det(8_000_000 + i)
+	return Dog{
+		Xid:     fmt.Sprintf("dog-%d", i),
+		Name:    firstNames[r.Intn(len(firstNames))],
+		GoodBoy: r.Intn(2) == 0,
+	}
+}
+
+// Cat is a deterministic Cat (Animal interface) record.
+type Cat struct {
+	Xid   string
+	Name  string
+	Lives int
+}
+
+// Cat returns the cat at index i.
+func (d Dataset) Cat(i int) Cat {
+	r := det(9_000_000 + i)
+	return Cat{
+		Xid:   fmt.Sprintf("cat-%d", i),
+		Name:  firstNames[r.Intn(len(firstNames))],
+		Lives: 1 + r.Intn(9),
 	}
 }
 
