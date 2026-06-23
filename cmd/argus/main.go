@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/dgraph-io/argus/pkg/cluster"
+	"github.com/dgraph-io/argus/pkg/envinfo"
 	"github.com/dgraph-io/argus/pkg/graphql"
 	"github.com/dgraph-io/argus/pkg/harness"
 	"github.com/dgraph-io/argus/pkg/output"
@@ -30,6 +31,7 @@ func main() {
 	small := flag.Bool("small", false, "Use the small dataset for smoke tests")
 	strict := flag.Bool("strict", false, "Fail fast on the first error (default: log and continue)")
 	vectorStrict := flag.Bool("vector-strict", false, "Assert exact similar_to nearest-neighbor recall (regression gate; expected to fail on builds with the HNSW upsert issue)")
+	dgraphBranch := flag.String("dgraph-branch", "", "Dgraph build branch under test, recorded in the report (from `dgraph version`; the cluster API exposes only the commit hash)")
 	verbose := flag.Bool("v", false, "Verbose logging")
 	flag.Parse()
 
@@ -63,6 +65,7 @@ func main() {
 		small:         *small,
 		strict:        *strict,
 		vectorStrict:  *vectorStrict,
+		dgraphBranch:  *dgraphBranch,
 	}
 
 	if err := run(ctx, cfg); err != nil {
@@ -84,6 +87,7 @@ type runConfig struct {
 	small         bool
 	strict        bool
 	vectorStrict  bool
+	dgraphBranch  string
 }
 
 func run(ctx context.Context, cfg runConfig) error {
@@ -104,14 +108,19 @@ func run(ctx context.Context, cfg runConfig) error {
 		slog.Warn("could not determine cluster version", "err", err)
 		version = "unknown"
 	}
-	slog.Info("cluster ready", "version", version)
+
+	env := envinfo.Collect(ctx, cfg.httpAddr, cfg.grpcAddr, version, cfg.dgraphBranch)
+	slog.Info("environment",
+		"dgraph_version", env.DgraphVersion, "branch", env.DgraphBranch,
+		"topology", env.Topology, "host", env.Hostname,
+		"cpu", env.NumCPU, "ram_gb", fmt.Sprintf("%.1f", env.TotalRAMGB), "os", env.OS,
+	)
 
 	output.SetInterval(cfg.flushInterval)
 	reporter, err := output.NewReporter(cfg.opsCSV, cfg.rtCSV, output.RunMeta{
-		DgraphVersion: version,
-		Cluster:       cfg.grpcAddr,
-		Seed:          cfg.seed,
-		StartedAt:     time.Now(),
+		Env:       env,
+		Seed:      cfg.seed,
+		StartedAt: time.Now(),
 	})
 	if err != nil {
 		return fmt.Errorf("open output: %w", err)

@@ -1,8 +1,9 @@
 // Package output writes periodic benchmark snapshots to CSV. Two files are
 // produced per run: an operations file (per-op-type throughput and latency
 // percentiles over each interval) and a runtime file (Go heap/GC/goroutine
-// samples). Both carry run metadata (Dgraph version, branch) in a comment
-// header so a CSV is self-describing.
+// samples). Both carry the run environment (Dgraph version/branch, cluster
+// topology, and host CPU/RAM) in a comment header so a CSV is self-describing
+// and results are comparable across hardware and cluster configurations.
 package output
 
 import (
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dgraph-io/argus/pkg/envinfo"
 	"github.com/dgraph-io/argus/pkg/metrics"
 )
 
@@ -28,10 +30,9 @@ type Reporter struct {
 
 // RunMeta is descriptive metadata recorded at the top of each CSV.
 type RunMeta struct {
-	DgraphVersion string
-	Cluster       string
-	Seed          int64
-	StartedAt     time.Time
+	Env       envinfo.Info
+	Seed      int64
+	StartedAt time.Time
 }
 
 // NewReporter creates the two CSV files and writes their headers.
@@ -69,8 +70,18 @@ func NewReporter(opsPath, runtimePath string, meta RunMeta) (*Reporter, error) {
 }
 
 func writeMeta(f *os.File, m RunMeta) {
-	fmt.Fprintf(f, "# argus run | dgraph_version=%s | cluster=%s | seed=%d | started=%s\n",
-		m.DgraphVersion, m.Cluster, m.Seed, m.StartedAt.Format(time.RFC3339))
+	e := m.Env
+	branch := e.DgraphBranch
+	if branch == "" {
+		branch = "unknown"
+	}
+	fmt.Fprintf(f, "# argus run | started=%s | seed=%d\n", m.StartedAt.Format(time.RFC3339), m.Seed)
+	fmt.Fprintf(f, "# dgraph | version=%s | branch=%s | cluster=%s | http=%s | cid=%s\n",
+		e.DgraphVersion, branch, e.ClusterGRPC, e.ClusterHTTP, e.ClusterID)
+	fmt.Fprintf(f, "# topology | %s | groups=%d | replicas=%d | alphas=%d | zeros=%d\n",
+		e.Topology, e.Groups, e.Replicas, e.NumAlphas, e.NumZeros)
+	fmt.Fprintf(f, "# host | name=%s | os=%s | cpu=%d | gomaxprocs=%d | ram_gb=%.2f | go=%s\n",
+		e.Hostname, e.OS, e.NumCPU, e.GOMAXPROCS, e.TotalRAMGB, e.GoVersion)
 }
 
 // WriteOps appends one interval's per-op snapshots.

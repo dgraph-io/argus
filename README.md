@@ -47,6 +47,7 @@ go build -o bin/argus ./cmd/argus
 | `-small` | `false` | Use the small dataset for smoke tests |
 | `-strict` | `false` | Fail fast on the first error; default logs and continues |
 | `-vector-strict` | `false` | Also assert exact `similar_to` nearest-neighbor recall (regression gate; fails on builds with the HNSW upsert issue) |
+| `-dgraph-branch` | `""` | Dgraph build branch under test, recorded in the report (from `dgraph version`; the cluster API exposes only the commit hash) |
 | `-seed` | `1` | Dataset seed (reserved; the dataset is index-deterministic) |
 | `-v` | `false` | Verbose logging |
 
@@ -67,6 +68,17 @@ go build -o bin/argus ./cmd/argus
 
 `*-runtime.csv` columns: `timestamp, elapsed_s, goroutines, alloc_mb, heap_alloc_mb, heap_sys_mb, heap_objects, num_gc, gc_pause_ms, gc_cpu_pct, next_gc_mb`.
 
+Both files begin with a `#` comment header recording the run environment so results are comparable across hardware and cluster configurations:
+
+```
+# argus run | started=... | seed=1
+# dgraph | version=v25.3.4-7-g1577f25c1 | branch=... | cluster=localhost:9080 | http=... | cid=...
+# topology | sharded+HA (3 group(s) x 3 replica(s); 9 alphas, 3 zeros) | groups=3 | replicas=3 | alphas=9 | zeros=3
+# host | name=... | os=linux/amd64 | cpu=32 | gomaxprocs=32 | ram_gb=128.00 | go=go1.26.4
+```
+
+Topology is read from the alpha `/state`: `groups` is the shard count and `replicas` the per-group HA factor, classified as `single` / `HA` / `sharded` / `sharded+HA`. The Dgraph version (with commit hash) comes from the cluster; the branch is operator-supplied via `-dgraph-branch`. Host CPU/RAM describe the load generator (which is also the cluster host for local runs).
+
 ## Architecture
 
 ```
@@ -75,6 +87,7 @@ pkg/
   cluster/        dgo client: connect, health, schema, transactions
   graphql/        thin net/http GraphQL client (query + admin schema)
   subscription/   graphql-ws WebSocket client + latency benchmark
+  envinfo/        host CPU/RAM + cluster topology/version capture
   schema/         DQL and GraphQL test schemas
   testdata/       deterministic dataset + upsert/delete builders
   queries/        DQL and GraphQL query catalogs
