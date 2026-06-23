@@ -14,17 +14,20 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dgraph-io/argus/pkg/clusterstats"
 	"github.com/dgraph-io/argus/pkg/envinfo"
 	"github.com/dgraph-io/argus/pkg/metrics"
 )
 
-// Reporter owns the operations and runtime CSV files for a run.
+// Reporter owns the operations, runtime, and cluster CSV files for a run.
 type Reporter struct {
 	mu     sync.Mutex
 	opsF   *os.File
 	opsW   *csv.Writer
 	rtF    *os.File
 	rtW    *csv.Writer
+	clF    *os.File
+	clW    *csv.Writer
 	closed bool
 }
 
@@ -35,8 +38,9 @@ type RunMeta struct {
 	StartedAt time.Time
 }
 
-// NewReporter creates the two CSV files and writes their headers.
-func NewReporter(opsPath, runtimePath string, meta RunMeta) (*Reporter, error) {
+// NewReporter creates the three CSV files and writes their headers. clusterPath
+// may be empty to skip the per-node cluster file.
+func NewReporter(opsPath, runtimePath, clusterPath string, meta RunMeta) (*Reporter, error) {
 	opsF, err := os.Create(opsPath)
 	if err != nil {
 		return nil, fmt.Errorf("create ops csv: %w", err)
@@ -52,8 +56,8 @@ func NewReporter(opsPath, runtimePath string, meta RunMeta) (*Reporter, error) {
 		rtF: rtF, rtW: csv.NewWriter(rtF),
 	}
 
-	writeMeta(opsF, meta)
-	writeMeta(rtF, meta)
+	writeMeta(opsF, meta, "client operation throughput & latency (per interval)")
+	writeMeta(rtF, meta, "load-generator (argus) Go runtime — NOT the Dgraph cluster")
 
 	r.opsW.Write([]string{
 		"timestamp", "elapsed_s", "op", "count", "errors",
@@ -66,16 +70,57 @@ func NewReporter(opsPath, runtimePath string, meta RunMeta) (*Reporter, error) {
 	})
 	r.opsW.Flush()
 	r.rtW.Flush()
+
+	if clusterPath != "" {
+		clF, err := os.Create(clusterPath)
+		if err != nil {
+			opsF.Close()
+			rtF.Close()
+			return nil, fmt.Errorf("create cluster csv: %w", err)
+		}
+		r.clF, r.clW = clF, csv.NewWriter(clF)
+		writeMeta(clF, meta, "per-Dgraph-node resource & throughput; node=CLUSTER is the aggregate")
+		r.clW.Write([]string{
+			"timestamp", "elapsed_s", "node", "leader", "rss_mb", "cpu_pct", "goroutines",
+			"heap_inuse_mb", "queries_per_s", "commits_per_s", "aborts_per_s",
+			"pending_queries", "active_mutations", "server_avg_ms",
+		})
+		r.clW.Flush()
+	}
 	return r, nil
 }
 
-func writeMeta(f *os.File, m RunMeta) {
+// WriteCluster appends one row per node plus the cluster aggregate row.
+func (r *Reporter) WriteCluster(ts time.Time, elapsed time.Duration, samples []clusterstats.NodeSample) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.clW == nil {
+		return nil
+	}
+	rows := append([]clusterstats.NodeSample{}, samples...)
+	rows = append(rows, clusterstats.Aggregate(samples))
+	for _, s := range rows {
+		r.clW.Write([]string{
+			ts.Format("2006-01-02T15:04:05.000"),
+			f2(elapsed.Seconds()),
+			s.Node,
+			strconv.FormatBool(s.Leader),
+			f2(s.RSSMB), f2(s.CPUPercent), f2(s.Goroutines), f2(s.HeapInuseMB),
+			f2(s.QueriesPerSec), f2(s.CommitsPerSec), f2(s.AbortsPerSec),
+			f2(s.PendingQueries), f2(s.ActiveMutations), f3(s.ServerAvgMs),
+		})
+	}
+	r.clW.Flush()
+	return r.clW.Error()
+}
+
+func writeMeta(f *os.File, m RunMeta, role string) {
 	e := m.Env
 	branch := e.DgraphBranch
 	if branch == "" {
 		branch = "unknown"
 	}
-	fmt.Fprintf(f, "# argus run | started=%s | seed=%d\n", m.StartedAt.Format(time.RFC3339), m.Seed)
+	fmt.Fprintf(f, "# argus run | started=%s | seed=%d | metrics=%s\n", m.StartedAt.Format(time.RFC3339), m.Seed, role)
 	fmt.Fprintf(f, "# dgraph | version=%s | branch=%s | cluster=%s | http=%s | cid=%s\n",
 		e.DgraphVersion, branch, e.ClusterGRPC, e.ClusterHTTP, e.ClusterID)
 	fmt.Fprintf(f, "# topology | %s | groups=%d | replicas=%d | alphas=%d | zeros=%d\n",
@@ -147,7 +192,7 @@ func (r *Reporter) WriteRuntime(ts time.Time, elapsed time.Duration, s metrics.R
 	return r.rtW.Error()
 }
 
-// Close flushes and closes both files.
+// Close flushes and closes all files.
 func (r *Reporter) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -159,6 +204,12 @@ func (r *Reporter) Close() error {
 	r.rtW.Flush()
 	err1 := r.opsF.Close()
 	err2 := r.rtF.Close()
+	if r.clW != nil {
+		r.clW.Flush()
+		if e := r.clF.Close(); e != nil && err2 == nil {
+			err2 = e
+		}
+	}
 	if err1 != nil {
 		return err1
 	}

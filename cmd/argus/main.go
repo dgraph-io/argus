@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/dgraph-io/argus/pkg/cluster"
+	"github.com/dgraph-io/argus/pkg/clusterstats"
 	"github.com/dgraph-io/argus/pkg/envinfo"
 	"github.com/dgraph-io/argus/pkg/graphql"
 	"github.com/dgraph-io/argus/pkg/harness"
@@ -19,10 +20,12 @@ import (
 )
 
 func main() {
-	grpcAddr := flag.String("cluster", "localhost:9080", "Dgraph cluster gRPC address (DQL)")
-	httpAddr := flag.String("graphql", "http://localhost:8080", "Dgraph alpha HTTP base URL (GraphQL)")
+	grpcAddr := flag.String("cluster", "localhost:9080", "Dgraph cluster gRPC address (DQL); seed for discovery")
+	httpAddr := flag.String("graphql", "http://localhost:8080", "Dgraph alpha HTTP base URL (GraphQL); seed for discovery")
+	alphas := flag.String("alphas", "", "Comma-separated alpha HTTP base URLs to load-balance over and scrape (default: discover from /state)")
 	opsCSV := flag.String("ops-output", "argus-ops.csv", "CSV path for per-op throughput/latency snapshots")
-	rtCSV := flag.String("runtime-output", "argus-runtime.csv", "CSV path for Go runtime/GC snapshots")
+	rtCSV := flag.String("runtime-output", "argus-runtime.csv", "CSV path for load-generator Go runtime/GC snapshots")
+	clusterCSV := flag.String("cluster-output", "argus-cluster.csv", "CSV path for per-Dgraph-node resource/throughput snapshots")
 	duration := flag.Duration("duration", 30*time.Minute, "Target run duration (a write pass always completes)")
 	flushInterval := flag.Duration("flush-interval", 5*time.Second, "Snapshot flush cadence")
 	writeConc := flag.Int("write-concurrency", 8, "Concurrent write workers")
@@ -55,8 +58,10 @@ func main() {
 	cfg := runConfig{
 		grpcAddr:      *grpcAddr,
 		httpAddr:      *httpAddr,
+		alphas:        *alphas,
 		opsCSV:        *opsCSV,
 		rtCSV:         *rtCSV,
+		clusterCSV:    *clusterCSV,
 		duration:      *duration,
 		flushInterval: *flushInterval,
 		writeConc:     *writeConc,
@@ -77,8 +82,10 @@ func main() {
 type runConfig struct {
 	grpcAddr      string
 	httpAddr      string
+	alphas        string
 	opsCSV        string
 	rtCSV         string
+	clusterCSV    string
 	duration      time.Duration
 	flushInterval time.Duration
 	writeConc     int
@@ -91,14 +98,23 @@ type runConfig struct {
 }
 
 func run(ctx context.Context, cfg runConfig) error {
-	slog.Info("connecting to cluster", "grpc", cfg.grpcAddr, "http", cfg.httpAddr)
-	dgraphClient, err := cluster.NewDgraphClient(ctx, cfg.grpcAddr)
+	// Resolve the set of alpha endpoints to load-balance over and scrape.
+	endpoints := envinfo.ResolveAlphas(ctx, cfg.httpAddr, cfg.grpcAddr, cfg.alphas)
+	grpcAddrs := make([]string, len(endpoints))
+	httpBases := make([]string, len(endpoints))
+	for i, e := range endpoints {
+		grpcAddrs[i] = e.GRPC
+		httpBases[i] = e.HTTP
+	}
+	slog.Info("connecting to cluster", "alphas", len(endpoints), "grpc", grpcAddrs, "http", httpBases)
+
+	dgraphClient, err := cluster.NewDgraphClient(ctx, grpcAddrs)
 	if err != nil {
 		return fmt.Errorf("connect DQL: %w", err)
 	}
 	defer dgraphClient.Close()
 
-	gqlClient := graphql.NewClient(cfg.httpAddr)
+	gqlClient := graphql.NewClient(httpBases...)
 	if err := gqlClient.Health(ctx); err != nil {
 		return fmt.Errorf("GraphQL health check: %w", err)
 	}
@@ -116,8 +132,10 @@ func run(ctx context.Context, cfg runConfig) error {
 		"cpu", env.NumCPU, "ram_gb", fmt.Sprintf("%.1f", env.TotalRAMGB), "os", env.OS,
 	)
 
+	scraper := clusterstats.New(endpoints)
+
 	output.SetInterval(cfg.flushInterval)
-	reporter, err := output.NewReporter(cfg.opsCSV, cfg.rtCSV, output.RunMeta{
+	reporter, err := output.NewReporter(cfg.opsCSV, cfg.rtCSV, cfg.clusterCSV, output.RunMeta{
 		Env:       env,
 		Seed:      cfg.seed,
 		StartedAt: time.Now(),
@@ -131,7 +149,7 @@ func run(ctx context.Context, cfg runConfig) error {
 	if cfg.small {
 		dataset = testdata.SmallDataset()
 	}
-	orch := harness.New(dgraphClient, gqlClient, reporter, harness.Options{
+	orch := harness.New(dgraphClient, gqlClient, reporter, scraper, harness.Options{
 		Duration:         cfg.duration,
 		FlushInterval:    cfg.flushInterval,
 		WriteConcurrency: cfg.writeConc,

@@ -9,9 +9,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -73,24 +76,8 @@ type stateResp struct {
 }
 
 func (i *Info) fetchTopology(ctx context.Context, httpBase string) {
-	url := strings.TrimRight(httpBase, "/") + "/state"
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	st, err := fetchState(ctx, httpBase)
 	if err != nil {
-		return
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return
-	}
-	var st stateResp
-	if json.Unmarshal(body, &st) != nil {
 		return
 	}
 	i.ClusterID = st.CID
@@ -102,6 +89,105 @@ func (i *Info) fetchTopology(ctx context.Context, httpBase string) {
 			i.Replicas = len(g.Members) // max members in any group == replication factor
 		}
 	}
+}
+
+func fetchState(ctx context.Context, httpBase string) (stateResp, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(httpBase, "/")+"/state", nil)
+	if err != nil {
+		return stateResp{}, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return stateResp{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return stateResp{}, err
+	}
+	var st stateResp
+	if err := json.Unmarshal(body, &st); err != nil {
+		return stateResp{}, err
+	}
+	return st, nil
+}
+
+// Endpoint pairs an alpha's HTTP base URL (for GraphQL + metrics scraping) with
+// its gRPC address (for dgo).
+type Endpoint struct {
+	HTTP string
+	GRPC string
+	Addr string // the /state member address (group/leader context), if discovered
+}
+
+// ResolveAlphas determines the alpha endpoints to load-balance across and
+// scrape. If alphasCSV is non-empty it is the authoritative list of HTTP base
+// URLs (gRPC derived as HTTP port + 1000). Otherwise endpoints are discovered
+// from the seed's /state, mapping each member's internal address (e.g. :7080)
+// to HTTP (:8080) and gRPC (:9080) via the standard port offsets. Falls back to
+// the seed endpoints if discovery yields nothing.
+func ResolveAlphas(ctx context.Context, seedHTTP, seedGRPC, alphasCSV string) []Endpoint {
+	if alphasCSV != "" {
+		var eps []Endpoint
+		for _, h := range strings.Split(alphasCSV, ",") {
+			h = strings.TrimSpace(h)
+			if h == "" {
+				continue
+			}
+			eps = append(eps, Endpoint{HTTP: h, GRPC: shiftPort(httpHostPort(h), 1000)})
+		}
+		if len(eps) > 0 {
+			return eps
+		}
+	}
+
+	st, err := fetchState(ctx, seedHTTP)
+	if err == nil {
+		var eps []Endpoint
+		seen := map[string]bool{}
+		for _, g := range st.Groups {
+			for _, m := range g.Members {
+				if m.AmDead || seen[m.Addr] {
+					continue
+				}
+				seen[m.Addr] = true
+				eps = append(eps, Endpoint{
+					HTTP: "http://" + shiftPort(m.Addr, 1000),
+					GRPC: shiftPort(m.Addr, 2000),
+					Addr: m.Addr,
+				})
+			}
+		}
+		if len(eps) > 0 {
+			return eps
+		}
+	}
+	return []Endpoint{{HTTP: seedHTTP, GRPC: seedGRPC}}
+}
+
+// httpHostPort extracts host:port from an http(s) URL.
+func httpHostPort(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return raw
+	}
+	return u.Host
+}
+
+// shiftPort returns host:(port+delta) for a host:port string; on parse failure
+// it returns the input unchanged.
+func shiftPort(hostPort string, delta int) string {
+	host, port, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		return hostPort
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		return hostPort
+	}
+	return net.JoinHostPort(host, strconv.Itoa(p+delta))
 }
 
 func (i *Info) topologySummary() string {

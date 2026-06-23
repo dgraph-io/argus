@@ -5,6 +5,7 @@ Argus exercises Dgraph for correctness while benchmarking write and query perfor
 ## What it does
 
 - **Concurrent read/write load.** Writers and readers run at the same time over the whole budget, mixing DQL and GraphQL.
+- **Multi-alpha aware.** argus discovers every alpha from the cluster `/state` (or takes an explicit `-alphas` list), load-balances DQL (dgo round-robin) and GraphQL (round-robin) across all of them, and scrapes each node's Prometheus metrics. So the workload exercises the whole cluster, not one entry point.
 - **Single + bulk write mix.** DQL persons and posts are split 50/50 by record: half go through single-record upserts, half through bulk upsert transactions of ~120 edges each. Both paths are idempotent and carry distinct CSV labels (`person` vs `person-bulk`) so their throughput and latency are directly comparable.
 - **Deterministic end state.** The corpus is a fixed, enumerable dataset keyed by stable external ids (DQL `xid`; GraphQL `@id`). All writes are idempotent upserts, so any order or repetition converges to the same logical graph. A serial finalize pass pins the end state.
 - **Complete verification.** Because the dataset is enumerable, validation reads back every persistent node and compares it field-by-field to the generator — no spot-checking — and asserts the node set matches exactly.
@@ -38,8 +39,10 @@ go build -o bin/argus ./cmd/argus
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `-cluster` | `localhost:9080` | Dgraph gRPC address (DQL) |
-| `-graphql` | `http://localhost:8080` | Alpha HTTP base URL (GraphQL) |
+| `-cluster` | `localhost:9080` | Dgraph gRPC address (DQL); seed for discovery |
+| `-graphql` | `http://localhost:8080` | Alpha HTTP base URL (GraphQL); seed for discovery |
+| `-alphas` | `""` | Comma-separated alpha HTTP base URLs to load-balance over and scrape (default: discover from `/state`) |
+| `-cluster-output` | `argus-cluster.csv` | CSV path for per-Dgraph-node resource/throughput snapshots |
 | `-duration` | `30m` | Target run duration; a write pass always completes |
 | `-flush-interval` | `5s` | Snapshot cadence |
 | `-write-concurrency` | `8` | Concurrent write workers |
@@ -66,7 +69,9 @@ go build -o bin/argus ./cmd/argus
 
 `*-ops.csv` columns: `timestamp, elapsed_s, op, count, errors, ops_per_s, avg_ms, min_ms, max_ms, p50_ms, p99_ms, avg_server_ms, touched_total`. `op` is `{domain}-{kind}:{label}`, e.g. `dql-query:recurse-friends-depth3` or `gql-write:product`.
 
-`*-runtime.csv` columns: `timestamp, elapsed_s, goroutines, alloc_mb, heap_alloc_mb, heap_sys_mb, heap_objects, num_gc, gc_pause_ms, gc_cpu_pct, next_gc_mb`.
+`*-runtime.csv` columns: `timestamp, elapsed_s, goroutines, alloc_mb, heap_alloc_mb, heap_sys_mb, heap_objects, num_gc, gc_pause_ms, gc_cpu_pct, next_gc_mb`. This is the **load generator's** (argus's) own Go runtime — not the cluster.
+
+`*-cluster.csv` columns: `timestamp, elapsed_s, node, leader, rss_mb, cpu_pct, goroutines, heap_inuse_mb, queries_per_s, commits_per_s, aborts_per_s, pending_queries, active_mutations, server_avg_ms`. One row **per alpha** scraped from its `/debug/prometheus_metrics`, plus a `node=CLUSTER` aggregate row. Aggregation respects metric type: gauges (RAM, goroutines) and rates (queries/s, CPU) are summed across nodes; the server latency average merges the histogram sum/count (not a mean-of-means). Counters are turned into per-interval rates via deltas. The per-node breakdown is kept so imbalance (a hot shard, a busy leader) is visible.
 
 Both files begin with a `#` comment header recording the run environment so results are comparable across hardware and cluster configurations:
 
@@ -85,9 +90,10 @@ Topology is read from the alpha `/state`: `groups` is the shard count and `repli
 cmd/argus/        CLI entry point
 pkg/
   cluster/        dgo client: connect, health, schema, transactions
-  graphql/        thin net/http GraphQL client (query + admin schema)
+  graphql/        thin net/http GraphQL client (round-robin over alphas)
   subscription/   graphql-ws WebSocket client + latency benchmark
-  envinfo/        host CPU/RAM + cluster topology/version capture
+  envinfo/        host CPU/RAM + cluster topology/version + endpoint discovery
+  clusterstats/   per-alpha Prometheus scrape + aggregation
   schema/         DQL and GraphQL test schemas
   testdata/       deterministic dataset + upsert/delete builders
   queries/        DQL and GraphQL query catalogs

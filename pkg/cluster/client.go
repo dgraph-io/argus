@@ -13,20 +13,28 @@ import (
 // DgraphClient wraps the dgo client with health checking and version detection.
 type DgraphClient struct {
 	Client *dgo.Dgraph
-	conn   *grpc.ClientConn
+	conns  []*grpc.ClientConn
 }
 
-// NewDgraphClient creates a new connection to a Dgraph cluster.
-func NewDgraphClient(ctx context.Context, addr string) (*DgraphClient, error) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, fmt.Errorf("failed to dial cluster: %w", err)
+// NewDgraphClient connects to one or more alpha gRPC addresses. When several are
+// given, dgo round-robins requests across them, spreading load over the cluster
+// rather than funnelling it through a single alpha.
+func NewDgraphClient(ctx context.Context, addrs []string) (*DgraphClient, error) {
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("no cluster addresses provided")
 	}
-
-	dc := &DgraphClient{
-		Client: dgo.NewDgraphClient(api.NewDgraphClient(conn)),
-		conn:   conn,
+	dc := &DgraphClient{}
+	apiClients := make([]api.DgraphClient, 0, len(addrs))
+	for _, addr := range addrs {
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			dc.Close()
+			return nil, fmt.Errorf("failed to dial %s: %w", addr, err)
+		}
+		dc.conns = append(dc.conns, conn)
+		apiClients = append(apiClients, api.NewDgraphClient(conn))
 	}
+	dc.Client = dgo.NewDgraphClient(apiClients...)
 
 	// Test connection
 	if err := dc.Health(ctx); err != nil {
@@ -65,7 +73,13 @@ func (c *DgraphClient) ReadOnlyTxn() *dgo.Txn {
 	return c.Client.NewReadOnlyTxn()
 }
 
-// Close closes the cluster connection.
+// Close closes all cluster connections.
 func (c *DgraphClient) Close() error {
-	return c.conn.Close()
+	var err error
+	for _, conn := range c.conns {
+		if e := conn.Close(); e != nil {
+			err = e
+		}
+	}
+	return err
 }

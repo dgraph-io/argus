@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/dgraph-io/argus/pkg/cluster"
+	"github.com/dgraph-io/argus/pkg/clusterstats"
 	"github.com/dgraph-io/argus/pkg/graphql"
 	"github.com/dgraph-io/argus/pkg/metrics"
 	"github.com/dgraph-io/argus/pkg/output"
@@ -36,16 +37,19 @@ type Orchestrator struct {
 	dgraph    *cluster.DgraphClient
 	gql       *graphql.Client
 	reporter  *output.Reporter
+	scraper   *clusterstats.Scraper
 	collector *metrics.Collector
 	opts      Options
 }
 
-// New creates an orchestrator.
-func New(dgraph *cluster.DgraphClient, gql *graphql.Client, reporter *output.Reporter, opts Options) *Orchestrator {
+// New creates an orchestrator. scraper may be nil to skip per-node cluster
+// metrics.
+func New(dgraph *cluster.DgraphClient, gql *graphql.Client, reporter *output.Reporter, scraper *clusterstats.Scraper, opts Options) *Orchestrator {
 	return &Orchestrator{
 		dgraph:    dgraph,
 		gql:       gql,
 		reporter:  reporter,
+		scraper:   scraper,
 		collector: metrics.NewCollector(),
 		opts:      opts,
 	}
@@ -91,7 +95,11 @@ func (o *Orchestrator) Run(ctx context.Context) (*validate.Result, error) {
 	<-subDone
 	stopFlush()
 	<-flushDone
-	o.flush(start) // final snapshot
+	// Final snapshot with a fresh context so it is captured even if the run
+	// context was cancelled (e.g. SIGINT).
+	finalCtx, cancelFinal := context.WithTimeout(context.Background(), 15*time.Second)
+	o.flush(finalCtx, start)
+	cancelFinal()
 
 	slog.Info("validating final graph")
 	result := validate.NewChecker(o.dgraph, o.gql, o.opts.Dataset, o.opts.VectorStrict).CheckAll(ctx)
@@ -133,12 +141,12 @@ func (o *Orchestrator) flushLoop(ctx context.Context, start time.Time) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			o.flush(start)
+			o.flush(ctx, start)
 		}
 	}
 }
 
-func (o *Orchestrator) flush(start time.Time) {
+func (o *Orchestrator) flush(ctx context.Context, start time.Time) {
 	now := time.Now()
 	elapsed := now.Sub(start)
 	if err := o.reporter.WriteOps(now, elapsed, o.collector.Snapshot()); err != nil {
@@ -146,6 +154,11 @@ func (o *Orchestrator) flush(start time.Time) {
 	}
 	if err := o.reporter.WriteRuntime(now, elapsed, metrics.SampleRuntime()); err != nil {
 		slog.Warn("runtime flush failed", "err", err)
+	}
+	if o.scraper != nil {
+		if err := o.reporter.WriteCluster(now, elapsed, o.scraper.Sample(ctx)); err != nil {
+			slog.Warn("cluster flush failed", "err", err)
+		}
 	}
 }
 

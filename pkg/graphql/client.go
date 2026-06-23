@@ -17,14 +17,19 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
-// Client is an HTTP client for Dgraph GraphQL and admin endpoints.
+// Client is an HTTP client for Dgraph GraphQL and admin endpoints. It can hold
+// several alpha base URLs and round-robins queries/mutations across them to
+// spread load over the cluster. Admin and schema operations always use the
+// first endpoint so they are applied consistently.
 type Client struct {
-	httpClient *http.Client
-	graphqlURL string // e.g. http://localhost:8080/graphql
-	adminURL   string // e.g. http://localhost:8080/admin
+	httpClient  *http.Client
+	graphqlURLs []string // one per alpha, e.g. http://alpha-i:8080/graphql
+	adminURL    string   // first alpha's /admin
+	next        atomic.Uint32
 }
 
 // Request is a GraphQL request body.
@@ -53,24 +58,33 @@ type Extensions struct {
 	} `json:"tracing,omitempty"`
 }
 
-// NewClient creates a GraphQL client. baseURL is the alpha HTTP address,
+// NewClient creates a GraphQL client over one or more alpha HTTP base URLs,
 // e.g. "http://localhost:8080".
-func NewClient(baseURL string) *Client {
-	baseURL = strings.TrimRight(baseURL, "/")
-	return &Client{
-		httpClient: &http.Client{Timeout: 60 * time.Second},
-		graphqlURL: baseURL + "/graphql",
-		adminURL:   baseURL + "/admin",
+func NewClient(baseURLs ...string) *Client {
+	c := &Client{httpClient: &http.Client{Timeout: 60 * time.Second}}
+	for _, b := range baseURLs {
+		b = strings.TrimRight(b, "/")
+		c.graphqlURLs = append(c.graphqlURLs, b+"/graphql")
 	}
+	if len(c.graphqlURLs) > 0 {
+		c.adminURL = strings.TrimRight(baseURLs[0], "/") + "/admin"
+	}
+	return c
 }
 
-// Endpoint returns the /graphql HTTP URL, used to derive the WebSocket URL for
-// subscriptions.
-func (c *Client) Endpoint() string { return c.graphqlURL }
+// Endpoint returns the first /graphql HTTP URL, used to derive the WebSocket URL
+// for subscriptions.
+func (c *Client) Endpoint() string {
+	if len(c.graphqlURLs) == 0 {
+		return ""
+	}
+	return c.graphqlURLs[0]
+}
 
-// Query executes a GraphQL query against /graphql.
+// Query executes a GraphQL query against /graphql, round-robining across alphas.
 func (c *Client) Query(ctx context.Context, query string, vars map[string]interface{}) (*Response, error) {
-	return c.do(ctx, c.graphqlURL, query, vars)
+	i := int(c.next.Add(1)-1) % len(c.graphqlURLs)
+	return c.do(ctx, c.graphqlURLs[i], query, vars)
 }
 
 // Admin executes a GraphQL query/mutation against /admin.
