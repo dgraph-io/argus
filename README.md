@@ -51,6 +51,7 @@ go build -o bin/argus ./cmd/argus
 | `-strict` | `false` | Fail fast on the first error; default logs and continues |
 | `-vector-strict` | `false` | Also assert exact `similar_to` nearest-neighbor recall (regression gate; fails on builds with the HNSW upsert issue) |
 | `-dgraph-branch` | `""` | Dgraph build branch under test, recorded in the report (from `dgraph version`; the cluster API exposes only the commit hash) |
+| `-label` | `""` | Free-form run annotation recorded in the report (e.g. `machine=e2-standard-4,nodes=3,region=us-central1,config=sharded`) |
 | `-seed` | `1` | Dataset seed (reserved; the dataset is index-deterministic) |
 | `-v` | `false` | Verbose logging |
 
@@ -105,6 +106,14 @@ pkg/
 ```
 
 The GraphQL client is a thin `net/http` wrapper rather than a community library: struct-based clients (shurcooL/graphql, hasura/go-graphql-client) need a Go type per query, which is a poor fit for a harness firing many dynamic queries, and machinebox/graphql is unmaintained. The native client also gives precise timing and direct access to the `touched_uids` extension.
+
+## Kubernetes / GKE
+
+argus must reach each alpha individually (to spread load and scrape per-node
+metrics), so on a multi-alpha cluster it should run **in-cluster** as a Job — an
+external LoadBalancer VIP randomizes which alpha each request hits and scrambles
+per-node scraping. See [deploy/README.md](deploy/README.md) for the image build,
+the Job manifest, and the laptop port-forward caveat.
 
 ## Local development
 

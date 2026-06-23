@@ -121,6 +121,9 @@ func writeMeta(f *os.File, m RunMeta, role string) {
 		branch = "unknown"
 	}
 	fmt.Fprintf(f, "# argus run | started=%s | seed=%d | metrics=%s\n", m.StartedAt.Format(time.RFC3339), m.Seed, role)
+	if e.Labels != "" {
+		fmt.Fprintf(f, "# labels | %s\n", e.Labels)
+	}
 	fmt.Fprintf(f, "# dgraph | version=%s | branch=%s | cluster=%s | http=%s | cid=%s\n",
 		e.DgraphVersion, branch, e.ClusterGRPC, e.ClusterHTTP, e.ClusterID)
 	fmt.Fprintf(f, "# topology | %s | groups=%d | replicas=%d | alphas=%d | zeros=%d\n",

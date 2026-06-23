@@ -29,6 +29,9 @@ type Info struct {
 	TotalRAMGB float64
 	GoVersion  string
 
+	// Operator-supplied free-form annotation (machine type, region, config, ...).
+	Labels string
+
 	// Dgraph cluster (the system under test).
 	DgraphVersion string // includes the commit hash, e.g. v25.3.4-7-g1577f25c1
 	DgraphBranch  string // operator-supplied; not exposed by the cluster API

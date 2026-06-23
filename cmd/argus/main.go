@@ -35,6 +35,7 @@ func main() {
 	strict := flag.Bool("strict", false, "Fail fast on the first error (default: log and continue)")
 	vectorStrict := flag.Bool("vector-strict", false, "Assert exact similar_to nearest-neighbor recall (regression gate; expected to fail on builds with the HNSW upsert issue)")
 	dgraphBranch := flag.String("dgraph-branch", "", "Dgraph build branch under test, recorded in the report (from `dgraph version`; the cluster API exposes only the commit hash)")
+	label := flag.String("label", "", "Free-form run annotation recorded in the report (e.g. machine=e2-standard-4,nodes=3,region=us-central1,config=sharded)")
 	verbose := flag.Bool("v", false, "Verbose logging")
 	flag.Parse()
 
@@ -71,6 +72,7 @@ func main() {
 		strict:        *strict,
 		vectorStrict:  *vectorStrict,
 		dgraphBranch:  *dgraphBranch,
+		label:         *label,
 	}
 
 	if err := run(ctx, cfg); err != nil {
@@ -95,6 +97,7 @@ type runConfig struct {
 	strict        bool
 	vectorStrict  bool
 	dgraphBranch  string
+	label         string
 }
 
 func run(ctx context.Context, cfg runConfig) error {
@@ -126,10 +129,12 @@ func run(ctx context.Context, cfg runConfig) error {
 	}
 
 	env := envinfo.Collect(ctx, cfg.httpAddr, cfg.grpcAddr, version, cfg.dgraphBranch)
+	env.Labels = cfg.label
 	slog.Info("environment",
 		"dgraph_version", env.DgraphVersion, "branch", env.DgraphBranch,
 		"topology", env.Topology, "host", env.Hostname,
 		"cpu", env.NumCPU, "ram_gb", fmt.Sprintf("%.1f", env.TotalRAMGB), "os", env.OS,
+		"labels", env.Labels,
 	)
 
 	scraper := clusterstats.New(endpoints)
