@@ -33,23 +33,37 @@ type window struct {
 	touched  uint64
 }
 
-// Collector accumulates operation timings into per-key windows.
+// cumulative holds whole-run (never reset) stats per key, used for the final
+// summary's true percentiles.
+type cumulative struct {
+	count    int
+	errors   int
+	hist     Histogram
+	serverNs uint64
+	touched  uint64
+}
+
+// Collector accumulates operation timings into per-key windows (for the
+// time-series CSV) and per-key cumulative histograms (for the final summary).
 type Collector struct {
 	mu      sync.Mutex
 	windows map[string]*window
+	cum     map[string]*cumulative
 }
 
 // NewCollector creates an empty collector.
 func NewCollector() *Collector {
-	return &Collector{windows: make(map[string]*window)}
+	return &Collector{windows: make(map[string]*window), cum: make(map[string]*cumulative)}
 }
 
 // Observe records one operation outcome under key (e.g. "dql-query:filter-age").
 // serverNs is server-reported total latency; touched is server-reported
 // uids/nodes touched. Both may be zero when unavailable.
 func (c *Collector) Observe(key string, d time.Duration, serverNs, touched uint64, ok bool) {
+	ms := float64(d.Microseconds()) / 1000
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	w := c.windows[key]
 	if w == nil {
 		w = &window{}
@@ -62,6 +76,19 @@ func (c *Collector) Observe(key string, d time.Duration, serverNs, touched uint6
 	w.durs = append(w.durs, d)
 	w.serverNs += serverNs
 	w.touched += touched
+
+	cu := c.cum[key]
+	if cu == nil {
+		cu = &cumulative{}
+		c.cum[key] = cu
+	}
+	cu.count++
+	if !ok {
+		cu.errors++
+	}
+	cu.hist.Observe(ms)
+	cu.serverNs += serverNs
+	cu.touched += touched
 }
 
 // OpSnapshot is the aggregate for one key over a window.
@@ -94,6 +121,56 @@ func (c *Collector) Snapshot() []OpSnapshot {
 	// Reset windows in place.
 	c.windows = make(map[string]*window, len(c.windows))
 
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+// OpSummary is the whole-run aggregate for one key, with true percentiles from
+// the cumulative histogram. ThroughputPerSec is filled in by the caller (which
+// knows the measured wall-clock).
+type OpSummary struct {
+	Key              string  `json:"key"`
+	Count            int     `json:"count"`
+	Errors           int     `json:"errors"`
+	ThroughputPerSec float64 `json:"throughput_per_s"`
+	AvgMs            float64 `json:"avg_ms"`
+	P50Ms            float64 `json:"p50_ms"`
+	P90Ms            float64 `json:"p90_ms"`
+	P99Ms            float64 `json:"p99_ms"`
+	P999Ms           float64 `json:"p999_ms"`
+	MaxMs            float64 `json:"max_ms"`
+	AvgServerMs      float64 `json:"avg_server_ms"`
+	TouchedTotal     uint64  `json:"touched_total"`
+}
+
+// FinalSummary returns whole-run per-key aggregates (not reset). Percentiles
+// come from the cumulative histogram; ThroughputPerSec is left zero for the
+// caller to populate from the measured duration.
+func (c *Collector) FinalSummary() []OpSummary {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]OpSummary, 0, len(c.cum))
+	for key, cu := range c.cum {
+		if cu.count == 0 {
+			continue
+		}
+		s := OpSummary{
+			Key:          key,
+			Count:        cu.count,
+			Errors:       cu.errors,
+			AvgMs:        cu.hist.Mean(),
+			P50Ms:        cu.hist.Percentile(50),
+			P90Ms:        cu.hist.Percentile(90),
+			P99Ms:        cu.hist.Percentile(99),
+			P999Ms:       cu.hist.Percentile(99.9),
+			MaxMs:        cu.hist.Max(),
+			TouchedTotal: cu.touched,
+		}
+		if cu.count > 0 {
+			s.AvgServerMs = float64(cu.serverNs) / float64(cu.count) / 1e6
+		}
+		out = append(out, s)
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out
 }

@@ -692,16 +692,18 @@ type reviewNode struct {
 }
 
 type productNode struct {
-	SKU          string       `json:"sku"`
-	Name         string       `json:"name"`
-	Description  string       `json:"description"`
-	Note         *string      `json:"note"`
-	Price        float64      `json:"price"`
-	Availability string       `json:"availability"`
-	Rating       float64      `json:"rating"`
-	CreatedAt    string       `json:"createdAt"`
-	Category     *struct{ Slug string `json:"slug"` } `json:"category"`
-	Reviews      []reviewNode `json:"reviews"`
+	SKU          string  `json:"sku"`
+	Name         string  `json:"name"`
+	Description  string  `json:"description"`
+	Note         *string `json:"note"`
+	Price        float64 `json:"price"`
+	Availability string  `json:"availability"`
+	Rating       float64 `json:"rating"`
+	CreatedAt    string  `json:"createdAt"`
+	Category     *struct {
+		Slug string `json:"slug"`
+	} `json:"category"`
+	Reviews []reviewNode `json:"reviews"`
 }
 
 func (c *Checker) checkAllProducts(ctx context.Context, add func(string, bool, string)) {

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,7 @@ type Config struct {
 	ReadConcurrency  int
 	Dataset          testdata.Dataset
 	Strict           bool
+	Passes           int // >0: run exactly this many write passes (fixed work); else run until the deadline
 }
 
 // Scheduler executes the mixed workload against the cluster.
@@ -82,11 +84,11 @@ func (s *Scheduler) Run(ctx context.Context, deadline time.Time) error {
 	}
 
 	passes := 0
-	for passes == 0 || time.Now().Before(deadline) {
+	for s.morePasses(passes, deadline) {
 		if ctx.Err() != nil {
 			break
 		}
-		slog.Info("write pass starting", "pass", passes+1)
+		slog.Info("write pass starting", "pass", passes+1, "of", passesLabel(s.cfg.Passes))
 		s.WritePass(ctx, s.cfg.WriteConcurrency, timedWriteAttempts, true)
 		passes++
 		slog.Info("write pass complete", "pass", passes)
@@ -95,6 +97,7 @@ func (s *Scheduler) Run(ctx context.Context, deadline time.Time) error {
 	cancelReaders()
 	readers.Wait()
 
+	_ = passes
 	slog.Info("running finalize pass (serial, guarantees deterministic end state)")
 	s.Finalize(ctx)
 
@@ -105,6 +108,23 @@ func (s *Scheduler) Run(ctx context.Context, deadline time.Time) error {
 		return s.Err()
 	}
 	return nil
+}
+
+// morePasses decides whether to run another write pass. In fixed-work mode
+// (Passes>0) it runs exactly Passes; otherwise it runs at least one and then
+// until the deadline.
+func (s *Scheduler) morePasses(done int, deadline time.Time) bool {
+	if s.cfg.Passes > 0 {
+		return done < s.cfg.Passes
+	}
+	return done == 0 || time.Now().Before(deadline)
+}
+
+func passesLabel(p int) string {
+	if p > 0 {
+		return strconv.Itoa(p)
+	}
+	return "duration"
 }
 
 // WritePass applies one full deterministic write pass at the given concurrency,
@@ -122,7 +142,9 @@ func (s *Scheduler) WritePass(ctx context.Context, conc, attempts int, ledger bo
 	}
 	for i := 0; i < d.NumCompanies; i++ {
 		c := d.Company(i)
-		stage1 = append(stage1, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLWrite, "company", testdata.CompanyUpsert(c), attempts) })
+		stage1 = append(stage1, func(ctx context.Context) {
+			s.dqlWrite(ctx, metrics.OpDQLWrite, "company", testdata.CompanyUpsert(c), attempts)
+		})
 	}
 	for i := 0; i < d.NumDogs; i++ {
 		dog := d.Dog(i)
@@ -144,7 +166,9 @@ func (s *Scheduler) WritePass(ctx context.Context, conc, attempts int, ledger bo
 	for i := 0; i < d.NumPersons; i++ {
 		p := d.Person(i)
 		if i%2 == 0 {
-			stage2 = append(stage2, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLWrite, "person", testdata.PersonUpsert(p), attempts) })
+			stage2 = append(stage2, func(ctx context.Context) {
+				s.dqlWrite(ctx, metrics.OpDQLWrite, "person", testdata.PersonUpsert(p), attempts)
+			})
 		} else {
 			bulkPersons = append(bulkPersons, p)
 		}
@@ -158,7 +182,9 @@ func (s *Scheduler) WritePass(ctx context.Context, conc, attempts int, ledger bo
 	for i := 0; i < d.NumPosts; i++ {
 		p := d.Post(i)
 		if i%2 == 0 {
-			stage2 = append(stage2, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLWrite, "post", testdata.PostUpsert(p), attempts) })
+			stage2 = append(stage2, func(ctx context.Context) {
+				s.dqlWrite(ctx, metrics.OpDQLWrite, "post", testdata.PostUpsert(p), attempts)
+			})
 		} else {
 			bulkPosts = append(bulkPosts, p)
 		}
@@ -178,7 +204,9 @@ func (s *Scheduler) WritePass(ctx context.Context, conc, attempts int, ledger bo
 			for j := range reviews {
 				reviews[j] = d.Review(i, j)
 			}
-			stage2 = append(stage2, func(ctx context.Context) { s.gqlWrite(ctx, "product-deep", testdata.AddProductDeep(p, reviews), attempts) })
+			stage2 = append(stage2, func(ctx context.Context) {
+				s.gqlWrite(ctx, "product-deep", testdata.AddProductDeep(p, reviews), attempts)
+			})
 		} else {
 			stage2 = append(stage2, func(ctx context.Context) { s.gqlWrite(ctx, "product", testdata.AddProduct(p), attempts) })
 			for j := 0; j < d.ReviewsPerProduct; j++ {
@@ -264,18 +292,24 @@ func (s *Scheduler) Finalize(ctx context.Context) {
 	dels := make([]task, 0, d.NumEphPersons+d.NumEphProducts)
 	for i := 0; i < d.NumEphPersons; i++ {
 		xid := d.EphPerson(i).Xid
-		dels = append(dels, func(ctx context.Context) { s.dqlWrite(ctx, metrics.OpDQLDelete, "eph-person", testdata.DeleteByXid(xid), finalizeWriteAttempts) })
+		dels = append(dels, func(ctx context.Context) {
+			s.dqlWrite(ctx, metrics.OpDQLDelete, "eph-person", testdata.DeleteByXid(xid), finalizeWriteAttempts)
+		})
 	}
 	for i := 0; i < d.NumEphProducts; i++ {
 		sku := d.EphProduct(i).SKU
-		dels = append(dels, func(ctx context.Context) { s.gqlDelete(ctx, "eph-product", testdata.DeleteProduct(sku), finalizeWriteAttempts) })
+		dels = append(dels, func(ctx context.Context) {
+			s.gqlDelete(ctx, "eph-product", testdata.DeleteProduct(sku), finalizeWriteAttempts)
+		})
 	}
 	// Guarantee the transient note is cleared from every product that the timed
 	// phase may have set it on, so the canonical end state has no note.
 	for i := 0; i < d.NumProducts; i++ {
 		if i%10 == 0 {
 			sku, note := d.Product(i).SKU, noteValue(i)
-			dels = append(dels, func(ctx context.Context) { s.gqlWrite(ctx, "remove-note", testdata.RemoveProductNote(sku, note), finalizeWriteAttempts) })
+			dels = append(dels, func(ctx context.Context) {
+				s.gqlWrite(ctx, "remove-note", testdata.RemoveProductNote(sku, note), finalizeWriteAttempts)
+			})
 		}
 	}
 	runPool(ctx, 1, dels)

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -16,17 +17,27 @@ import (
 	"github.com/dgraph-io/argus/pkg/graphql"
 	"github.com/dgraph-io/argus/pkg/harness"
 	"github.com/dgraph-io/argus/pkg/output"
+	"github.com/dgraph-io/argus/pkg/report"
 	"github.com/dgraph-io/argus/pkg/testdata"
 )
 
 func main() {
+	// Subcommand: argus compare ...
+	if len(os.Args) > 1 && os.Args[1] == "compare" {
+		runCompare(os.Args[2:])
+		return
+	}
+
 	grpcAddr := flag.String("cluster", "localhost:9080", "Dgraph cluster gRPC address (DQL); seed for discovery")
 	httpAddr := flag.String("graphql", "http://localhost:8080", "Dgraph alpha HTTP base URL (GraphQL); seed for discovery")
 	alphas := flag.String("alphas", "", "Comma-separated alpha HTTP base URLs to load-balance over and scrape (default: discover from /state)")
 	opsCSV := flag.String("ops-output", "argus-ops.csv", "CSV path for per-op throughput/latency snapshots")
 	rtCSV := flag.String("runtime-output", "argus-runtime.csv", "CSV path for load-generator Go runtime/GC snapshots")
 	clusterCSV := flag.String("cluster-output", "argus-cluster.csv", "CSV path for per-Dgraph-node resource/throughput snapshots")
-	duration := flag.Duration("duration", 30*time.Minute, "Target run duration (a write pass always completes)")
+	summaryOut := flag.String("summary-output", "argus-summary.json", "JSON path for the per-run summary used by `argus compare`")
+	passes := flag.Int("passes", 10, "Fixed-work mode: run exactly N write passes (primary; set 0 to use -duration instead)")
+	duration := flag.Duration("duration", 0, "Duration mode: run for this long (used only when -passes=0)")
+	repeats := flag.Int("repeats", 1, "Repeat the whole measurement N times, emitting one summary per repeat (for a noise floor)")
 	flushInterval := flag.Duration("flush-interval", 5*time.Second, "Snapshot flush cadence")
 	writeConc := flag.Int("write-concurrency", 8, "Concurrent write workers")
 	readConc := flag.Int("read-concurrency", 8, "Concurrent read workers")
@@ -63,7 +74,10 @@ func main() {
 		opsCSV:        *opsCSV,
 		rtCSV:         *rtCSV,
 		clusterCSV:    *clusterCSV,
+		summaryOut:    *summaryOut,
+		passes:        *passes,
 		duration:      *duration,
+		repeats:       *repeats,
 		flushInterval: *flushInterval,
 		writeConc:     *writeConc,
 		readConc:      *readConc,
@@ -88,7 +102,10 @@ type runConfig struct {
 	opsCSV        string
 	rtCSV         string
 	clusterCSV    string
+	summaryOut    string
+	passes        int
 	duration      time.Duration
+	repeats       int
 	flushInterval time.Duration
 	writeConc     int
 	readConc      int
@@ -138,51 +155,90 @@ func run(ctx context.Context, cfg runConfig) error {
 	)
 
 	scraper := clusterstats.New(endpoints)
-
 	output.SetInterval(cfg.flushInterval)
-	reporter, err := output.NewReporter(cfg.opsCSV, cfg.rtCSV, cfg.clusterCSV, output.RunMeta{
-		Env:       env,
-		Seed:      cfg.seed,
-		StartedAt: time.Now(),
-	})
-	if err != nil {
-		return fmt.Errorf("open output: %w", err)
-	}
-	defer reporter.Close()
 
 	dataset := testdata.DefaultDataset()
 	if cfg.small {
 		dataset = testdata.SmallDataset()
 	}
-	orch := harness.New(dgraphClient, gqlClient, reporter, scraper, harness.Options{
-		Duration:         cfg.duration,
-		FlushInterval:    cfg.flushInterval,
-		WriteConcurrency: cfg.writeConc,
-		ReadConcurrency:  cfg.readConc,
-		Strict:           cfg.strict,
-		VectorStrict:     cfg.vectorStrict,
-		Dataset:          dataset,
-	})
-
-	result, err := orch.Run(ctx)
-	if err != nil {
-		return err
+	// -passes is primary; fall back to -duration, else a default duration.
+	passes, duration := cfg.passes, cfg.duration
+	if passes <= 0 && duration <= 0 {
+		duration = 30 * time.Minute
+	}
+	if cfg.repeats < 1 {
+		cfg.repeats = 1
 	}
 
-	passed := 0
-	for _, c := range result.Checks {
-		if c.Passed {
-			passed++
+	var failed bool
+	for rep := 1; rep <= cfg.repeats; rep++ {
+		suffix := ""
+		if cfg.repeats > 1 {
+			suffix = fmt.Sprintf("-%d", rep)
 		}
+		reporter, err := output.NewReporter(
+			withSuffix(cfg.opsCSV, suffix), withSuffix(cfg.rtCSV, suffix), withSuffix(cfg.clusterCSV, suffix),
+			output.RunMeta{Env: env, Seed: cfg.seed, StartedAt: time.Now()})
+		if err != nil {
+			return fmt.Errorf("open output: %w", err)
+		}
+
+		orch := harness.New(dgraphClient, gqlClient, reporter, scraper, harness.Options{
+			Duration:         duration,
+			FlushInterval:    cfg.flushInterval,
+			WriteConcurrency: cfg.writeConc,
+			ReadConcurrency:  cfg.readConc,
+			Strict:           cfg.strict,
+			VectorStrict:     cfg.vectorStrict,
+			Passes:           passes,
+			Seed:             cfg.seed,
+			Env:              env,
+			Dataset:          dataset,
+		})
+
+		if cfg.repeats > 1 {
+			slog.Info("repeat starting", "repeat", rep, "of", cfg.repeats)
+		}
+		result, summary, runErr := orch.Run(ctx)
+		reporter.Close()
+		if summary != nil {
+			summary.Repeat = rep
+			sp := withSuffix(cfg.summaryOut, suffix)
+			if err := report.WriteJSON(sp, summary); err != nil {
+				slog.Warn("write summary failed", "err", err)
+			} else {
+				slog.Info("summary written", "path", sp)
+			}
+		}
+		if runErr != nil {
+			return runErr
+		}
+
+		passed := 0
+		for _, c := range result.Checks {
+			if c.Passed {
+				passed++
+			}
+		}
+		if !result.AllPassed {
+			failed = true
+		}
+		slog.Info("run complete", "repeat", rep, "validation_passed", result.AllPassed,
+			"checks", fmt.Sprintf("%d/%d", passed, len(result.Checks)))
 	}
-	slog.Info("run complete",
-		"ops_csv", cfg.opsCSV,
-		"runtime_csv", cfg.rtCSV,
-		"validation_passed", result.AllPassed,
-		"checks", fmt.Sprintf("%d/%d", passed, len(result.Checks)),
-	)
-	if !result.AllPassed {
-		return fmt.Errorf("validation failed: %d/%d checks passed", passed, len(result.Checks))
+
+	if failed {
+		return fmt.Errorf("validation failed")
 	}
 	return nil
+}
+
+// withSuffix inserts suffix before the file extension, e.g.
+// withSuffix("argus-ops.csv", "-2") => "argus-ops-2.csv".
+func withSuffix(path, suffix string) string {
+	if suffix == "" {
+		return path
+	}
+	ext := filepath.Ext(path)
+	return path[:len(path)-len(ext)] + suffix + ext
 }

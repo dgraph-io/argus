@@ -43,7 +43,10 @@ go build -o bin/argus ./cmd/argus
 | `-graphql` | `http://localhost:8080` | Alpha HTTP base URL (GraphQL); seed for discovery |
 | `-alphas` | `""` | Comma-separated alpha HTTP base URLs to load-balance over and scrape (default: discover from `/state`) |
 | `-cluster-output` | `argus-cluster.csv` | CSV path for per-Dgraph-node resource/throughput snapshots |
-| `-duration` | `30m` | Target run duration; a write pass always completes |
+| `-passes` | `10` | Fixed-work mode (primary): run exactly N write passes. Set `0` to use `-duration` |
+| `-duration` | `0` | Duration mode: run for this long (used only when `-passes=0`; defaults to 30m if both are 0) |
+| `-repeats` | `1` | Repeat the whole measurement N times, emitting one summary per repeat (for a noise floor) |
+| `-summary-output` | `argus-summary.json` | JSON summary used by `argus compare` |
 | `-flush-interval` | `5s` | Snapshot cadence |
 | `-write-concurrency` | `8` | Concurrent write workers |
 | `-read-concurrency` | `8` | Concurrent read workers |
@@ -102,10 +105,45 @@ pkg/
   metrics/        windowed aggregation + runtime sampling
   output/         two-CSV reporter
   validate/       deterministic correctness checks
-  harness/        orchestrator: setup -> workload -> validate
+  report/         per-run summary JSON + regression compare
+  harness/        orchestrator: setup -> workload -> validate -> summary
 ```
 
 The GraphQL client is a thin `net/http` wrapper rather than a community library: struct-based clients (shurcooL/graphql, hasura/go-graphql-client) need a Go type per query, which is a poor fit for a harness firing many dynamic queries, and machinebox/graphql is unmaintained. The native client also gives precise timing and direct access to the `touched_uids` extension.
+
+## Regression testing (primary use)
+
+The main job of argus is to smoke-test a candidate Dgraph build against a
+released one and catch performance regressions. Each run writes a machine-
+readable summary JSON (full-run latency percentiles per op, throughput, and
+steady-state per-cluster resource); `argus compare` diffs them and exits
+non-zero on a regression, so it drops into CI.
+
+```bash
+# Baseline: released version (run a few repeats to establish the noise floor).
+argus -small -passes 10 -repeats 3 -dgraph-branch released-v25.3.4 \
+  -summary-output released.json     # -> released-1.json released-2.json released-3.json
+
+# Candidate: the build under test, same hardware + same workload.
+argus -small -passes 10 -repeats 3 -dgraph-branch feature/my-change \
+  -summary-output candidate.json    # -> candidate-1.json ...
+
+# Compare; non-zero exit = regression.
+argus compare \
+  -baseline  released-1.json,released-2.json,released-3.json \
+  -candidate candidate-1.json,candidate-2.json,candidate-3.json \
+  -latency 0.10 -throughput 0.10 -resource 0.15
+```
+
+A metric is flagged only when the candidate is worse by more than the threshold
+**and** by more than the measured run-to-run noise (the rel. stddev across
+repeats) — so noise alone never trips the gate. `compare` also warns when the
+two sides differ in anything but the Dgraph version (host, topology, workload),
+which would invalidate the comparison.
+
+`-passes` (fixed work) is primary so both versions run the *identical* operation
+set, making latency apples-to-apples; `-duration` (fixed time) is available for
+a throughput-over-a-window comparison.
 
 ## Kubernetes / GKE
 

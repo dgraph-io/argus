@@ -7,13 +7,16 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/dgraph-io/argus/pkg/cluster"
 	"github.com/dgraph-io/argus/pkg/clusterstats"
+	"github.com/dgraph-io/argus/pkg/envinfo"
 	"github.com/dgraph-io/argus/pkg/graphql"
 	"github.com/dgraph-io/argus/pkg/metrics"
 	"github.com/dgraph-io/argus/pkg/output"
+	"github.com/dgraph-io/argus/pkg/report"
 	"github.com/dgraph-io/argus/pkg/schema"
 	"github.com/dgraph-io/argus/pkg/subscription"
 	"github.com/dgraph-io/argus/pkg/testdata"
@@ -29,17 +32,21 @@ type Options struct {
 	ReadConcurrency  int
 	Strict           bool
 	VectorStrict     bool
+	Passes           int // >0: fixed-work mode
+	Seed             int64
+	Env              envinfo.Info
 	Dataset          testdata.Dataset
 }
 
 // Orchestrator coordinates the phases of a run.
 type Orchestrator struct {
-	dgraph    *cluster.DgraphClient
-	gql       *graphql.Client
-	reporter  *output.Reporter
-	scraper   *clusterstats.Scraper
-	collector *metrics.Collector
-	opts      Options
+	dgraph     *cluster.DgraphClient
+	gql        *graphql.Client
+	reporter   *output.Reporter
+	scraper    *clusterstats.Scraper
+	collector  *metrics.Collector
+	opts       Options
+	clusterAgg []clusterstats.NodeSample // CLUSTER aggregate per flush, for steady-state summary
 }
 
 // New creates an orchestrator. scraper may be nil to skip per-node cluster
@@ -55,10 +62,11 @@ func New(dgraph *cluster.DgraphClient, gql *graphql.Client, reporter *output.Rep
 	}
 }
 
-// Run executes setup, the timed concurrent workload, and validation.
-func (o *Orchestrator) Run(ctx context.Context) (*validate.Result, error) {
+// Run executes setup, the concurrent workload, and validation, returning the
+// validation result and a machine-readable run summary for regression compare.
+func (o *Orchestrator) Run(ctx context.Context) (*validate.Result, *report.RunSummary, error) {
 	if err := o.setup(ctx); err != nil {
-		return nil, fmt.Errorf("setup: %w", err)
+		return nil, nil, fmt.Errorf("setup: %w", err)
 	}
 
 	start := time.Now()
@@ -87,9 +95,11 @@ func (o *Orchestrator) Run(ctx context.Context) (*validate.Result, error) {
 		ReadConcurrency:  o.opts.ReadConcurrency,
 		Dataset:          o.opts.Dataset,
 		Strict:           o.opts.Strict,
+		Passes:           o.opts.Passes,
 	})
-	slog.Info("workload starting", "duration", o.opts.Duration, "deadline", deadline.Format(time.RFC3339))
+	slog.Info("workload starting", "mode", o.mode(), "duration", o.opts.Duration, "passes", o.opts.Passes)
 	workloadErr := sched.Run(ctx, deadline)
+	measured := time.Since(start)
 
 	stopSub()
 	<-subDone
@@ -105,10 +115,91 @@ func (o *Orchestrator) Run(ctx context.Context) (*validate.Result, error) {
 	result := validate.NewChecker(o.dgraph, o.gql, o.opts.Dataset, o.opts.VectorStrict).CheckAll(ctx)
 	o.logValidation(result)
 
+	summary := o.buildSummary(measured)
+
 	if workloadErr != nil {
-		return result, fmt.Errorf("workload: %w", workloadErr)
+		return result, summary, fmt.Errorf("workload: %w", workloadErr)
 	}
-	return result, nil
+	return result, summary, nil
+}
+
+func (o *Orchestrator) mode() string {
+	if o.opts.Passes > 0 {
+		return "passes"
+	}
+	return "duration"
+}
+
+// buildSummary assembles the machine-readable run summary: full-run per-op
+// stats (throughput from the measured wall-clock) and steady-state cluster
+// resource (median of the CLUSTER aggregate samples).
+func (o *Orchestrator) buildSummary(measured time.Duration) *report.RunSummary {
+	secs := measured.Seconds()
+	ops := o.collector.FinalSummary()
+	if secs > 0 {
+		for i := range ops {
+			ops[i].ThroughputPerSec = float64(ops[i].Count) / secs
+		}
+	}
+	return &report.RunSummary{
+		Env:             o.opts.Env,
+		Mode:            o.mode(),
+		Passes:          o.opts.Passes,
+		Seed:            o.opts.Seed,
+		StartedAt:       time.Now().Add(-measured).Format(time.RFC3339),
+		MeasuredSeconds: secs,
+		Ops:             ops,
+		Cluster:         o.clusterSummary(),
+	}
+}
+
+// clusterSummary medians each field of the accumulated CLUSTER aggregate samples
+// (steady state). The first sample is skipped as warm-up/baseline.
+func (o *Orchestrator) clusterSummary() report.ClusterSummary {
+	s := o.clusterAgg
+	if len(s) > 2 {
+		s = s[1:] // drop the first (cold / no-rate) sample
+	}
+	if len(s) == 0 {
+		return report.ClusterSummary{Nodes: o.scraperNodes()}
+	}
+	med := func(get func(clusterstats.NodeSample) float64) float64 {
+		xs := make([]float64, len(s))
+		for i, n := range s {
+			xs[i] = get(n)
+		}
+		return median(xs)
+	}
+	return report.ClusterSummary{
+		Nodes:           o.scraperNodes(),
+		RSSMBTotal:      med(func(n clusterstats.NodeSample) float64 { return n.RSSMB }),
+		CPUPercentTotal: med(func(n clusterstats.NodeSample) float64 { return n.CPUPercent }),
+		GoroutinesTotal: med(func(n clusterstats.NodeSample) float64 { return n.Goroutines }),
+		QueriesPerSec:   med(func(n clusterstats.NodeSample) float64 { return n.QueriesPerSec }),
+		CommitsPerSec:   med(func(n clusterstats.NodeSample) float64 { return n.CommitsPerSec }),
+		AbortsPerSec:    med(func(n clusterstats.NodeSample) float64 { return n.AbortsPerSec }),
+		ServerAvgMs:     med(func(n clusterstats.NodeSample) float64 { return n.ServerAvgMs }),
+	}
+}
+
+func (o *Orchestrator) scraperNodes() int {
+	if o.scraper == nil {
+		return 0
+	}
+	return o.scraper.Nodes()
+}
+
+func median(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	sorted := append([]float64{}, xs...)
+	sort.Float64s(sorted)
+	n := len(sorted)
+	if n%2 == 1 {
+		return sorted[n/2]
+	}
+	return (sorted[n/2-1] + sorted[n/2]) / 2
 }
 
 func (o *Orchestrator) setup(ctx context.Context) error {
@@ -156,8 +247,12 @@ func (o *Orchestrator) flush(ctx context.Context, start time.Time) {
 		slog.Warn("runtime flush failed", "err", err)
 	}
 	if o.scraper != nil {
-		if err := o.reporter.WriteCluster(now, elapsed, o.scraper.Sample(ctx)); err != nil {
+		samples := o.scraper.Sample(ctx)
+		if err := o.reporter.WriteCluster(now, elapsed, samples); err != nil {
 			slog.Warn("cluster flush failed", "err", err)
+		}
+		if len(samples) > 0 {
+			o.clusterAgg = append(o.clusterAgg, clusterstats.Aggregate(samples))
 		}
 	}
 }

@@ -34,10 +34,10 @@ const (
 
 // Benchmark drives the subscription latency measurement.
 type Benchmark struct {
-	gql      *graphql.Client
-	wsURL    string
+	gql       *graphql.Client
+	wsURL     string
 	collector *metrics.Collector
-	cadence  time.Duration
+	cadence   time.Duration
 
 	mu     sync.Mutex
 	commit map[int]time.Time // tick -> commit time
