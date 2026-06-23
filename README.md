@@ -74,6 +74,7 @@ cmd/argus/        CLI entry point
 pkg/
   cluster/        dgo client: connect, health, schema, transactions
   graphql/        thin net/http GraphQL client (query + admin schema)
+  subscription/   graphql-ws WebSocket client + latency benchmark
   schema/         DQL and GraphQL test schemas
   testdata/       deterministic dataset + upsert/delete builders
   queries/        DQL and GraphQL query catalogs
