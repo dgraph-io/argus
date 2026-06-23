@@ -1,0 +1,8 @@
+# argus run | started=2026-06-23T17:07:19-04:00 | seed=1 | metrics=load-generator (argus) Go runtime — NOT the Dgraph cluster
+# labels | machine=M4,ram=64GB,core=12,config=1zero-1alpha,deploy=docker-compose
+# dgraph | version=v25.3.6 | branch=v25.3.6 | cluster=localhost:9080 | http=http://localhost:8080 | cid=6051feda-096e-4ce8-b9b4-5d8270b35f42
+# topology | single (1 group(s) x 1 replica(s); 1 alphas, 1 zeros) | groups=1 | replicas=1 | alphas=1 | zeros=1
+# host | name=Hercules.local | os=darwin/arm64 | cpu=12 | gomaxprocs=12 | ram_gb=64.00 | go=go1.26.4
+timestamp,elapsed_s,goroutines,alloc_mb,heap_alloc_mb,heap_sys_mb,heap_objects,num_gc,gc_pause_ms,gc_cpu_pct,next_gc_mb
+2026-06-23T17:07:29.049,5.00,32,3.32,3.32,14.25,15162,362,0.050,0.48,5.10
+2026-06-23T17:07:31.965,7.92,9,2.79,2.79,14.41,13025,510,0.072,0.51,4.00

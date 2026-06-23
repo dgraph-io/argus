@@ -20,10 +20,24 @@ type RunSummary struct {
 	Passes          int                 `json:"passes"`
 	Repeat          int                 `json:"repeat"`
 	Seed            int64               `json:"seed"`
+	Dataset         DatasetInfo         `json:"dataset"`
 	StartedAt       string              `json:"started_at"`
 	MeasuredSeconds float64             `json:"measured_seconds"`
 	Ops             []metrics.OpSummary `json:"ops"`
 	Cluster         ClusterSummary      `json:"cluster"`
+}
+
+// DatasetInfo records the corpus sizes, so a comparison can refuse runs whose
+// workloads differ.
+type DatasetInfo struct {
+	Persons    int `json:"persons"`
+	Posts      int `json:"posts"`
+	Products   int `json:"products"`
+	Reviews    int `json:"reviews"`
+	Companies  int `json:"companies"`
+	Categories int `json:"categories"`
+	Dogs       int `json:"dogs"`
+	Cats       int `json:"cats"`
 }
 
 // ClusterSummary is the steady-state server-side aggregate across all alphas

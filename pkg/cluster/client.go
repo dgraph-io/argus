@@ -63,6 +63,12 @@ func (c *DgraphClient) ApplySchema(ctx context.Context, schema string) error {
 	return c.Client.Alter(ctx, op)
 }
 
+// DropAll removes all data and schema, so a run starts from a clean slate and
+// the deterministic dataset is exactly what the graph contains.
+func (c *DgraphClient) DropAll(ctx context.Context) error {
+	return c.Client.Alter(ctx, &api.Operation{DropOp: api.Operation_ALL})
+}
+
 // Txn returns a transaction for read-write operations.
 func (c *DgraphClient) Txn() *dgo.Txn {
 	return c.Client.NewTxn()

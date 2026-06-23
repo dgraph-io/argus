@@ -32,7 +32,8 @@ type Options struct {
 	ReadConcurrency  int
 	Strict           bool
 	VectorStrict     bool
-	Passes           int // >0: fixed-work mode
+	NoDrop           bool // skip the clean-slate DropAll at setup
+	Passes           int  // >0: fixed-work mode
 	Seed             int64
 	Env              envinfo.Info
 	Dataset          testdata.Dataset
@@ -141,11 +142,17 @@ func (o *Orchestrator) buildSummary(measured time.Duration) *report.RunSummary {
 			ops[i].ThroughputPerSec = float64(ops[i].Count) / secs
 		}
 	}
+	d := o.opts.Dataset
 	return &report.RunSummary{
-		Env:             o.opts.Env,
-		Mode:            o.mode(),
-		Passes:          o.opts.Passes,
-		Seed:            o.opts.Seed,
+		Env:    o.opts.Env,
+		Mode:   o.mode(),
+		Passes: o.opts.Passes,
+		Seed:   o.opts.Seed,
+		Dataset: report.DatasetInfo{
+			Persons: d.NumPersons, Posts: d.NumPosts, Products: d.NumProducts,
+			Reviews: d.NumProducts * d.ReviewsPerProduct, Companies: d.NumCompanies,
+			Categories: d.NumCategories, Dogs: d.NumDogs, Cats: d.NumCats,
+		},
 		StartedAt:       time.Now().Add(-measured).Format(time.RFC3339),
 		MeasuredSeconds: secs,
 		Ops:             ops,
@@ -203,6 +210,16 @@ func median(xs []float64) float64 {
 }
 
 func (o *Orchestrator) setup(ctx context.Context) error {
+	// Start from a clean slate so the graph ends up as exactly the deterministic
+	// dataset; otherwise data left by a prior (e.g. larger-scale) run survives as
+	// "extra" records and the complete validation fails.
+	if !o.opts.NoDrop {
+		slog.Info("dropping all data (clean slate)")
+		if err := o.dgraph.DropAll(ctx); err != nil {
+			return fmt.Errorf("drop all: %w", err)
+		}
+	}
+
 	// GraphQL schema first, then DQL. The interop type PersonView maps onto the
 	// DQL Person predicates (xid/name/age/bio); applying the DQL Alter last makes
 	// it authoritative for those shared predicates, so updateGQLSchema cannot

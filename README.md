@@ -51,6 +51,8 @@ go build -o bin/argus ./cmd/argus
 | `-write-concurrency` | `8` | Concurrent write workers |
 | `-read-concurrency` | `8` | Concurrent read workers |
 | `-small` | `false` | Use the small dataset for smoke tests |
+| `-scale` | `0` | Scale the default dataset by this factor (e.g. `0.5`); size a run to a target wall-clock. Overrides `-small` |
+| `-no-drop` | `false` | Skip the clean-slate drop-all at the start of each run (default drops, so the graph is exactly the dataset) |
 | `-strict` | `false` | Fail fast on the first error; default logs and continues |
 | `-vector-strict` | `false` | Also assert exact `similar_to` nearest-neighbor recall (regression gate; fails on builds with the HNSW upsert issue) |
 | `-dgraph-branch` | `""` | Dgraph build branch under test, recorded in the report (from `dgraph version`; the cluster API exposes only the commit hash) |
@@ -60,7 +62,7 @@ go build -o bin/argus ./cmd/argus
 
 ## How a run proceeds
 
-1. **Setup** — apply the DQL schema (`Alter`) and the GraphQL schema (`updateGQLSchema`).
+1. **Setup** — drop all data (clean slate, unless `-no-drop`) so the graph ends up as exactly the deterministic dataset, then apply the GraphQL schema (`updateGQLSchema`) and the DQL schema (`Alter`).
 2. **Mixed workload** — readers loop the query catalog while writers apply the dataset in idempotent upsert passes, repeating until the deadline. Snapshots flush every interval. A write pass always runs to completion, so the run may slightly exceed the target duration: completeness wins over the deadline.
 3. **Finalize** — a serial (conflict-free) pass re-applies every persistent record and deletes every ephemeral record, guaranteeing the deterministic end state.
 4. **Validation** — complete, not sampled. Every persistent node is read back (paginated) and compared field-by-field to the generator: values, edges, geo coordinates, and timestamps. The node set must equal the expected set exactly, so any missing, extra (e.g. a leaked ephemeral), or mismatched record fails. Geo-index (`near`/`within`) and `shortest`-path queries are additionally checked for functional correctness.

@@ -225,6 +225,9 @@ func envWarnings(baseline, candidate []*RunSummary) []string {
 	if baseline[0].Mode != candidate[0].Mode || baseline[0].Passes != candidate[0].Passes {
 		w = append(w, fmt.Sprintf("workload differs: baseline mode=%s passes=%d vs candidate mode=%s passes=%d", baseline[0].Mode, baseline[0].Passes, candidate[0].Mode, candidate[0].Passes))
 	}
+	if baseline[0].Dataset != candidate[0].Dataset {
+		w = append(w, fmt.Sprintf("dataset differs: baseline %+v vs candidate %+v — not comparable", baseline[0].Dataset, candidate[0].Dataset))
+	}
 	if b.DgraphVersion == c.DgraphVersion {
 		w = append(w, fmt.Sprintf("both sides report the same Dgraph version (%s) — nothing to compare?", b.DgraphVersion))
 	}

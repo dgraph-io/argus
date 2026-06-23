@@ -130,6 +130,35 @@ func DefaultDataset() Dataset {
 	}
 }
 
+// ScaledDataset uniformly scales the default corpus by factor s (s=1 is the
+// default dataset; s=0.5 is half-size; etc.), so a run can be sized to fit a
+// target wall-clock on given hardware. Counts floor at 1. The dataset stays
+// fully deterministic — scaling just changes how many indices are enumerated.
+func ScaledDataset(s float64) Dataset {
+	if s <= 0 {
+		s = 1
+	}
+	d := DefaultDataset()
+	n := func(v int) int {
+		scaled := int(float64(v) * s)
+		if scaled < 1 {
+			return 1
+		}
+		return scaled
+	}
+	d.NumCompanies = n(d.NumCompanies)
+	d.NumPersons = n(d.NumPersons)
+	d.NumEphPersons = n(d.NumEphPersons)
+	d.NumPosts = n(d.NumPosts)
+	d.NumCategories = n(d.NumCategories)
+	d.NumProducts = n(d.NumProducts)
+	d.NumEphProducts = n(d.NumEphProducts)
+	d.NumDogs = n(d.NumDogs)
+	d.NumCats = n(d.NumCats)
+	// ReviewsPerProduct is a per-product multiplier; left unscaled.
+	return d
+}
+
 // SmallDataset returns a tiny corpus for smoke tests and quick determinism
 // checks. Same ~5% ephemeral ratio and edge structure as DefaultDataset.
 func SmallDataset() Dataset {

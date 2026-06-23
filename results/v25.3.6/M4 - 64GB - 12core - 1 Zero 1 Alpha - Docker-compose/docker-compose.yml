@@ -1,0 +1,37 @@
+# Dgraph v25.3.6 — 1 Zero + 1 Alpha (no replication).
+#
+# Hardware/config tier: M4, 64 GB, 12 core, Docker-compose (this folder).
+#
+# Single alpha isolates the Dgraph version's own performance: on one machine,
+# HA replication just triples CPU/disk work with no extra hardware, so a 3-replica
+# cluster here measures self-contention, not the version. Use this for fast local
+# version comparison; use the 3-HA config (or GKE, where replicas land on separate
+# nodes) for real HA numbers.
+#
+# A top-level `name:` pins the Compose project, so `docker compose down` works
+# even if this folder is renamed (the earlier gotcha).
+#
+# Run it with ./run.sh (canonical command lives there). The run passes -alphas
+# explicitly because /state reports the docker-internal name (alpha:7080), which
+# the host can't resolve; localhost:8080 maps to the alpha.
+
+name: argus-1zero1alpha
+
+services:
+  zero:
+    image: dgraph/dgraph:v25.3.6
+    container_name: argus-s-zero
+    command: dgraph zero --my=zero:5080
+    ports:
+      - "5080:5080" # gRPC (raft)
+      - "6080:6080" # HTTP (/state, admin) — manual use; argus reads /state from the alpha
+
+  alpha:
+    image: dgraph/dgraph:v25.3.6
+    container_name: argus-s-alpha
+    command: dgraph alpha --my=alpha:7080 --zero=zero:5080 --security whitelist=0.0.0.0/0
+    ports:
+      - "8080:8080" # HTTP (GraphQL, /debug/prometheus_metrics)
+      - "9080:9080" # gRPC (DQL)
+    depends_on:
+      - zero

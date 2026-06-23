@@ -1,0 +1,10 @@
+# argus run | started=2026-06-23T17:07:19-04:00 | seed=1 | metrics=per-Dgraph-node resource & throughput; node=CLUSTER is the aggregate
+# labels | machine=M4,ram=64GB,core=12,config=1zero-1alpha,deploy=docker-compose
+# dgraph | version=v25.3.6 | branch=v25.3.6 | cluster=localhost:9080 | http=http://localhost:8080 | cid=6051feda-096e-4ce8-b9b4-5d8270b35f42
+# topology | single (1 group(s) x 1 replica(s); 1 alphas, 1 zeros) | groups=1 | replicas=1 | alphas=1 | zeros=1
+# host | name=Hercules.local | os=darwin/arm64 | cpu=12 | gomaxprocs=12 | ram_gb=64.00 | go=go1.26.4
+timestamp,elapsed_s,node,leader,rss_mb,cpu_pct,goroutines,heap_inuse_mb,queries_per_s,commits_per_s,aborts_per_s,pending_queries,active_mutations,server_avg_ms
+2026-06-23T17:07:29.049,5.00,localhost:8080,true,2028.88,0.00,147.00,1501.36,0.00,0.00,0.00,16.00,22.00,0.000
+2026-06-23T17:07:29.049,5.00,CLUSTER,true,2028.88,0.00,147.00,1501.36,0.00,0.00,0.00,16.00,22.00,0.000
+2026-06-23T17:07:31.965,7.92,localhost:8080,true,2037.74,193.57,98.00,1204.40,1210.82,427.63,35.69,0.00,0.00,1.158
+2026-06-23T17:07:31.965,7.92,CLUSTER,true,2037.74,193.57,98.00,1204.40,1210.82,427.63,35.69,0.00,0.00,1.158

@@ -43,6 +43,8 @@ func main() {
 	readConc := flag.Int("read-concurrency", 8, "Concurrent read workers")
 	seed := flag.Int64("seed", 1, "Dataset seed (reserved; dataset is index-deterministic)")
 	small := flag.Bool("small", false, "Use the small dataset for smoke tests")
+	scale := flag.Float64("scale", 0, "Scale the default dataset by this factor (e.g. 0.5); 0 = default size, overrides -small")
+	noDrop := flag.Bool("no-drop", false, "Skip the clean-slate drop-all at the start of each run (default: drop so the graph is exactly the dataset)")
 	strict := flag.Bool("strict", false, "Fail fast on the first error (default: log and continue)")
 	vectorStrict := flag.Bool("vector-strict", false, "Assert exact similar_to nearest-neighbor recall (regression gate; expected to fail on builds with the HNSW upsert issue)")
 	dgraphBranch := flag.String("dgraph-branch", "", "Dgraph build branch under test, recorded in the report (from `dgraph version`; the cluster API exposes only the commit hash)")
@@ -83,6 +85,8 @@ func main() {
 		readConc:      *readConc,
 		seed:          *seed,
 		small:         *small,
+		scale:         *scale,
+		noDrop:        *noDrop,
 		strict:        *strict,
 		vectorStrict:  *vectorStrict,
 		dgraphBranch:  *dgraphBranch,
@@ -111,6 +115,8 @@ type runConfig struct {
 	readConc      int
 	seed          int64
 	small         bool
+	scale         float64
+	noDrop        bool
 	strict        bool
 	vectorStrict  bool
 	dgraphBranch  string
@@ -158,7 +164,10 @@ func run(ctx context.Context, cfg runConfig) error {
 	output.SetInterval(cfg.flushInterval)
 
 	dataset := testdata.DefaultDataset()
-	if cfg.small {
+	switch {
+	case cfg.scale > 0:
+		dataset = testdata.ScaledDataset(cfg.scale)
+	case cfg.small:
 		dataset = testdata.SmallDataset()
 	}
 	// -passes is primary; fall back to -duration, else a default duration.
@@ -190,6 +199,7 @@ func run(ctx context.Context, cfg runConfig) error {
 			ReadConcurrency:  cfg.readConc,
 			Strict:           cfg.strict,
 			VectorStrict:     cfg.vectorStrict,
+			NoDrop:           cfg.noDrop,
 			Passes:           passes,
 			Seed:             cfg.seed,
 			Env:              env,
