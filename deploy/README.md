@@ -17,28 +17,50 @@ Running argus **as a Job in the same namespace** fixes this: `/state`-discovered
 per-pod addresses resolve, each alpha's `:8080`/`:9080` is reachable, load
 spreads evenly across pods, and the cluster CSV gets real per-node data.
 
+**For GKE benchmarking you normally don't touch this Job directly** — the
+orchestrator [`deploy/gke/benchmark.sh`](gke/) drives it end to end (provision a
+dedicated-pool cluster → deploy Dgraph → render + run this Job → copy the ledger
+line into [`results/gke/runs.jsonl`](../results/gke) → `argus compare`). See
+[deploy/gke/README.md](gke/README.md) for that workflow. This doc covers the Job
+itself and the manual path for when you're not using the orchestrator:
+
 ```bash
 # 1. Build and push the image (built on the host so the local dgo replace resolves).
-deploy/build-image.sh us-docker.pkg.dev/PROJECT/REPO/argus:v1
-docker push us-docker.pkg.dev/PROJECT/REPO/argus:v1
+deploy/build-image.sh us-docker.pkg.dev/PROJECT/REPO/argus:v1 --push
 
-# 2. Edit deploy/argus-job.yaml: set the image, namespace, alpha Service name,
-#    -label (machine type / node count / config / region), and -dgraph-branch.
-kubectl apply -f deploy/argus-job.yaml
+# 2. Render the Job template and apply it. Only the ${VARS} are substituted;
+#    the container's $(DGRAPH_ALPHA) downward-ref is left alone. Workload shape is
+#    the canonical library shape (scale 0.25 / passes 5 / repeats 3 / wc 8); the
+#    candidate you compare against a baseline must match its shape.
+export JOB_NAME=argus NAMESPACE=dgraph ALPHA_SVC=dgraph-dgraph-alpha \
+  ARGUS_IMAGE=us-docker.pkg.dev/PROJECT/REPO/argus:v1 \
+  RUN_ID=$(date +%Y%m%d-%H%M%S)-ha3 PASSES=5 REPEATS=3 SCALE=0.25 WRITE_CONC=8 \
+  CPU_CLASS=n2-standard-8 DISK_CLASS=pd-ssd DEPLOY=gke LABEL=config=ha3 \
+  SHARD_BALANCE=false ZERO_URL=http://dgraph-dgraph-zero:6080 \
+  DGRAPH_BRANCH="" DGRAPH_COMMIT="$(kubectl -n dgraph exec dgraph-dgraph-alpha-0 -- dgraph version 2>/dev/null | awk -F': ' '/Commit SHA/{print $2}')"
+envsubst < deploy/argus-job.tmpl.yaml | kubectl -n "$NAMESPACE" apply -f -
 
 # 3. Watch it.
-kubectl logs -f job/argus
+kubectl -n dgraph logs -f job/argus
 
-# 4. Copy the CSVs out (the pod lingers ttlSecondsAfterFinished).
-kubectl cp "$(kubectl get pod -l app=argus -o name | head -1 | cut -d/ -f2)":/out ./results
+# 4. Copy the ledger line + CSVs out (the pod lingers ttlSecondsAfterFinished).
+pod="$(kubectl -n dgraph get pod -l app=argus -o name | head -1 | cut -d/ -f2)"
+kubectl -n dgraph cp "$pod":/out ./out
+cat ./out/runs.jsonl >> path/to/results/gke/runs.jsonl   # append to the durable ledger
 ```
+
+For sharded configs, set `SHARD_BALANCE=true` so argus spreads predicates across
+groups after applying the schema (needs `ZERO_URL`); it's a no-op for <2 groups.
 
 argus only needs the alpha **Service** as a discovery seed (`-graphql`/`-cluster`);
 it finds every alpha from `/state` and talks to them directly. No need to enumerate
 pods, and the zero Service can stay ClusterIP (argus reads `/state` from an alpha).
 
-Schedule argus on a **separate node pool** from Dgraph (see the `nodeSelector` in
-the Job) so the load generator doesn't compete with the system under test for CPU.
+The Job writes its ledger line to `/out/runs.jsonl` in an `emptyDir` (this run's
+repeats only); copy it out and append to your durable baselines ledger. The Job
+pins `nodeSelector: workload=argus` so the load generator lands on the argus/system
+pool, never competing with the Dgraph nodes (labeled+tainted `workload=dgraph` by
+`gke-provision.sh`) for CPU.
 
 ## Laptop access (smoke tests only)
 
@@ -71,7 +93,10 @@ argus -small -duration 2m \
 - **No TLS or ACL client support.** argus dials `insecure` gRPC and plain `http://`.
   The default deploy has neither enabled; if you turn on TLS or ACL, argus needs new
   flags first.
-- **`--security whitelist`** (if you add one) must include argus's source. In-cluster
-  the pod CIDR is simplest.
+- **`--security whitelist`** must include argus's source, or the alpha rejects its
+  `/admin`/`/health`/`/state` calls with "unauthorized ip address". The orchestrated
+  path handles this — `local-provision.sh` assembles `alpha.extraFlags` with the
+  private-range whitelist (and any `--alpha-extra-flags`) automatically. If you
+  deploy Dgraph by hand, whitelist the pod CIDR yourself.
 - **Subscriptions** ride the L4 LoadBalancer fine; an L7 ingress may break the
   WebSocket upgrade or time out idle connections.

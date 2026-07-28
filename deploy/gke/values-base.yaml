@@ -1,0 +1,45 @@
+# Shared benchmark values for the official dgraph/dgraph Helm chart.
+#
+# Topology-agnostic reproducibility pinning; the per-topology knobs
+# (alpha.replicaCount, zero.shardReplicaCount) and resources are applied as
+# `--set` overrides by local-provision.sh from the --config descriptor and the
+# --alpha-*/--zero-* flags. image.tag is set per deploy (--image-tag).
+#
+# Pinned here (the same for every topology, so runs are comparable):
+#   - pd-ssd persistence (storageClass "ssd" — created by gke-provision.sh)
+#   - scheduling onto the dedicated Dgraph node pool (label+taint workload=dgraph),
+#     keeping the system-under-test off the argus load-generator's nodes
+#
+# Resources are intentionally NOT hardcoded here: requests==limits (Guaranteed
+# QoS, no bursting/noisy-neighbor) are sized to the chosen machine type by
+# local-provision.sh, so a bigger benchmark node actually gets used.
+
+zero:
+  replicaCount: 1
+  persistence:
+    enabled: true
+    storageClass: ssd
+    size: 10Gi
+  nodeSelector:
+    workload: dgraph
+  tolerations:
+    - key: workload
+      operator: Equal
+      value: dgraph
+      effect: NoSchedule
+
+alpha:
+  # alpha.extraFlags is assembled and injected by local-provision.sh (the argus IP
+  # whitelist, plus any --alpha-extra-flags like --feature-flags=...) via a values
+  # overlay, so it is intentionally not set here.
+  persistence:
+    enabled: true
+    storageClass: ssd
+    size: 20Gi
+  nodeSelector:
+    workload: dgraph
+  tolerations:
+    - key: workload
+      operator: Equal
+      value: dgraph
+      effect: NoSchedule

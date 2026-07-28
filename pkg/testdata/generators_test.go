@@ -1,6 +1,7 @@
 package testdata
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -65,6 +66,87 @@ func TestBulkPersonUpserts(t *testing.T) {
 	q := reqs[0].Query
 	if strings.Count(q, "as var(func: eq(xid,") < 4 {
 		t.Errorf("bulk query block should bind several xids:\n%s", q)
+	}
+}
+
+func TestBulkRecordDeterministic(t *testing.T) {
+	d := SmallDataset()
+	a, b := d.BulkRecord(7), d.BulkRecord(7)
+	if a != b {
+		t.Fatalf("BulkRecord(7) not deterministic: %+v vs %+v", a, b)
+	}
+	if a.Brid != "bulk-7" {
+		t.Errorf("unexpected brid %q", a.Brid)
+	}
+}
+
+func TestBulkRecordInsertsBlind(t *testing.T) {
+	d := SmallDataset()
+	recs := make([]BulkRecord, d.NumBulkRecords)
+	for i := range recs {
+		recs[i] = d.BulkRecord(i)
+	}
+	const group = 140
+	// Scalar-only path (no hubs): blind, conflict-free.
+	reqs := BulkRecordInserts(recs, nil, nil, group)
+
+	wantBatches := (d.NumBulkRecords + group - 1) / group
+	if len(reqs) != wantBatches {
+		t.Fatalf("got %d batches, want %d", len(reqs), wantBatches)
+	}
+
+	totalNquads := 0
+	for _, r := range reqs {
+		// Blind insert: no upsert query block, exactly one set mutation, commit-now.
+		if r.Query != "" {
+			t.Errorf("bulk insert must be blind, got query block: %q", r.Query)
+		}
+		if !r.CommitNow || len(r.Mutations) != 1 {
+			t.Fatalf("unexpected request shape: commitNow=%v mutations=%d", r.CommitNow, len(r.Mutations))
+		}
+		nq := string(r.Mutations[0].SetNquads)
+		if strings.Contains(nq, "uid(") {
+			t.Errorf("blind insert should use blank nodes, not uid() refs: %q", nq)
+		}
+		if !strings.Contains(nq, "_:b") {
+			t.Errorf("expected blank-node subjects, got %q", nq)
+		}
+		totalNquads += strings.Count(nq, " .\n")
+	}
+	if want := d.NumBulkRecords * NQuadsPerBulkRecord; totalNquads != want {
+		t.Errorf("emitted %d nquads, want %d", totalNquads, want)
+	}
+}
+
+func TestBulkRecordInsertsEdges(t *testing.T) {
+	d := SmallDataset() // 500 records, 125 hubs, 4 edges
+	recs := make([]BulkRecord, d.NumBulkRecords)
+	for i := range recs {
+		recs[i] = d.BulkRecord(i)
+	}
+	hubUIDs := make([]string, d.BulkHubs)
+	for h := range hubUIDs {
+		hubUIDs[h] = "0x" + strconv.Itoa(h+1) // stand-in captured uids
+	}
+	reqs := BulkRecordInserts(recs, hubUIDs, d.BulkHubIndices, 140)
+
+	edges := 0
+	for _, r := range reqs {
+		nq := string(r.Mutations[0].SetNquads)
+		edges += strings.Count(nq, "<brhub>")
+		// Edges reference real uids, not blank nodes or query vars.
+		if strings.Contains(nq, "<brhub> _:") || strings.Contains(nq, "uid(") {
+			t.Errorf("brhub edges must target captured uids, got %q", nq)
+		}
+	}
+	if want := d.NumBulkRecords * d.BulkEdges; edges != want {
+		t.Errorf("emitted %d brhub edges, want %d", edges, want)
+	}
+	// Every record's hub set is distinct and the right size.
+	for i := 0; i < d.NumBulkRecords; i++ {
+		if got := len(d.BulkHubIndices(i)); got != d.BulkEdges {
+			t.Fatalf("record %d has %d hub indices, want %d", i, got, d.BulkEdges)
+		}
 	}
 }
 

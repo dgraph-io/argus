@@ -82,7 +82,7 @@ func NewReporter(opsPath, runtimePath, clusterPath string, meta RunMeta) (*Repor
 		writeMeta(clF, meta, "per-Dgraph-node resource & throughput; node=CLUSTER is the aggregate")
 		r.clW.Write([]string{
 			"timestamp", "elapsed_s", "node", "leader", "rss_mb", "cpu_pct", "goroutines",
-			"heap_inuse_mb", "queries_per_s", "commits_per_s", "aborts_per_s",
+			"heap_inuse_mb", "jemalloc_mb", "queries_per_s", "commits_per_s", "aborts_per_s",
 			"pending_queries", "active_mutations", "server_avg_ms",
 		})
 		r.clW.Flush()
@@ -105,7 +105,7 @@ func (r *Reporter) WriteCluster(ts time.Time, elapsed time.Duration, samples []c
 			f2(elapsed.Seconds()),
 			s.Node,
 			strconv.FormatBool(s.Leader),
-			f2(s.RSSMB), f2(s.CPUPercent), f2(s.Goroutines), f2(s.HeapInuseMB),
+			f2(s.RSSMB), f2(s.CPUPercent), f2(s.Goroutines), f2(s.HeapInuseMB), f2(s.JemallocMB),
 			f2(s.QueriesPerSec), f2(s.CommitsPerSec), f2(s.AbortsPerSec),
 			f2(s.PendingQueries), f2(s.ActiveMutations), f3(s.ServerAvgMs),
 		})
@@ -126,8 +126,8 @@ func writeMeta(f *os.File, m RunMeta, role string) {
 	}
 	fmt.Fprintf(f, "# dgraph | version=%s | branch=%s | cluster=%s | http=%s | cid=%s\n",
 		e.DgraphVersion, branch, e.ClusterGRPC, e.ClusterHTTP, e.ClusterID)
-	fmt.Fprintf(f, "# topology | %s | groups=%d | replicas=%d | alphas=%d | zeros=%d\n",
-		e.Topology, e.Groups, e.Replicas, e.NumAlphas, e.NumZeros)
+	fmt.Fprintf(f, "# topology | %s | groups=%d | replicas=%d | alphas=%d | learners=%d | zeros=%d\n",
+		e.Topology(), e.Groups, e.Replicas, e.NumAlphas, e.NumLearners, e.NumZeros)
 	fmt.Fprintf(f, "# host | name=%s | os=%s | cpu=%d | gomaxprocs=%d | ram_gb=%.2f | go=%s\n",
 		e.Hostname, e.OS, e.NumCPU, e.GOMAXPROCS, e.TotalRAMGB, e.GoVersion)
 }

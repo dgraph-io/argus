@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>argus — run comparison</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1f2328; --muted: #656d76; --line: #d0d7de;
+    --panel: #f6f8fa; --accent: #0969da;
+    --good: 46,160,67;   /* green rgb */
+    --bad: 209,36,47;    /* red rgb   */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --line:#30363d;
+            --panel:#161b22; --accent:#4493f8; --good:63,185,80; --bad:248,81,73; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+         color: var(--fg); background: var(--bg); padding: 20px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+       margin: 26px 0 8px; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+  .sub { color: var(--muted); margin: 0 0 16px; }
+  .controls { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 8px; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 12px; color: var(--muted); }
+  select, input[type=file], button { font: inherit; padding: 6px 8px; border: 1px solid var(--line);
+           border-radius: 6px; background: var(--bg); color: var(--fg); }
+  select { min-width: 340px; }
+  button { cursor: pointer; background: var(--panel); }
+  button:hover { border-color: var(--accent); }
+  .legend { display: flex; gap: 16px; align-items: center; color: var(--muted); font-size: 12px; margin: 4px 0 0; }
+  .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 5px; }
+  .note { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid #d29922;
+          border-radius: 6px; padding: 8px 12px; margin: 12px 0; color: var(--fg); font-size: 13px; }
+  table { border-collapse: collapse; width: 100%; }
+  .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; }
+  th, td { padding: 5px 9px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  th { position: sticky; top: 0; background: var(--panel); color: var(--muted); font-weight: 600; font-size: 12px; z-index: 1; }
+  td.k, th.k { text-align: left; font-variant-numeric: tabular-nums; }
+  td.k { position: sticky; left: 0; background: var(--bg); font-weight: 500; }
+  .num { font-variant-numeric: tabular-nums; }
+  .delta { font-variant-numeric: tabular-nums; font-weight: 600; border-radius: 4px; }
+  .within { color: var(--muted); font-weight: 500; } /* delta inside the noise floor */
+  .base, .cand { color: var(--muted); }
+  .idtab td { text-align: left; }
+  .idtab td.v { font-variant-numeric: tabular-nums; }
+  .diffrow { color: var(--accent); font-weight: 600; }
+  code { background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+  .hint { text-transform: none; font-weight: 400; font-size: 12px; color: var(--muted); }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+  <h1>argus — run comparison</h1>
+  <p class="sub">Diff any two runs from <code>runs.jsonl</code>. Green = better, red = worse, per each metric's direction. By default only deltas that clear the run-to-run noise are colored (uncheck <em>noise-aware</em> for the raw view) — this mirrors <code>argus compare</code>'s gate and keeps drift from painting a wall of red. Values are the <strong>median across a run's repeats</strong>, so one outlier repeat (a lone multi-second stall) can't dominate the tail metrics.</p>
+
+  <div class="controls">
+    <div class="field">
+      <label for="base">Baseline</label>
+      <select id="base"></select>
+    </div>
+    <div class="field">
+      <label for="cand">Candidate</label>
+      <select id="cand"></select>
+    </div>
+    <button id="swap" title="Swap baseline and candidate">⇄ swap</button>
+    <div class="field">
+      <label for="file">runs.jsonl (if not auto-loaded)</label>
+      <input type="file" id="file" accept=".jsonl,.json,.txt">
+    </div>
+  </div>
+  <div class="legend">
+    <span><span class="swatch" style="background:rgba(46,160,67,.55)"></span>improvement</span>
+    <span><span class="swatch" style="background:rgba(209,36,47,.55)"></span>regression</span>
+    <span><span class="swatch" style="background:transparent;border:1px solid var(--line)"></span>neutral / within noise</span>
+    <label style="cursor:pointer"><input type="checkbox" id="gate" checked> noise-aware (only color deltas past run-to-run noise ×1.5)</label>
+    <span id="status"></span>
+  </div>
+
+  <div id="warn"></div>
+  <div id="out"></div>
+
+<script>
+"use strict";
+
+// ---- metric direction: +1 higher-is-better, -1 lower-is-better, 0 neutral ----
+const HIGHER = new Set(["throughput_per_s","queries_per_s","commits_per_s","nquads_per_s","records_per_s"]);
+const LOWER  = new Set(["avg_ms","p50_ms","p90_ms","p99_ms","p999_ms","max_ms","avg_server_ms","errors",
+                        "rss_mb_per_alpha","jemalloc_mb_per_alpha","cpu_pct_per_alpha","aborts_per_s","server_avg_ms",
+                        "goroutines_per_alpha","measured_seconds","seconds","batch_p50_ms","batch_p99_ms","retries"]);
+const dir = (m) => HIGHER.has(m) ? 1 : LOWER.has(m) ? -1 : 0;
+
+// per-op metric columns, in display order
+const OP_COLS = ["count","errors","throughput_per_s","avg_ms","p50_ms","p90_ms","p99_ms","p999_ms","max_ms","avg_server_ms","touched_total"];
+// write_balance_cv is left out of HIGHER/LOWER on purpose → it renders neutral
+// (uncolored): ~0 means writes spread evenly across alphas, high means
+// concentrated, but it's only meaningful for sharded configs (HA writes-to-leader
+// legitimately show a high CV), so auto-coloring it would mislead.
+const CLUSTER_COLS = ["rss_mb_per_alpha","jemalloc_mb_per_alpha","cpu_pct_per_alpha","goroutines_per_alpha","queries_per_s","commits_per_s","aborts_per_s","server_avg_ms","write_balance_cv"];
+// Resource metrics are cluster SUMS in the ledger; dividing by the alpha count
+// shows per-node load, so a cross-topology diff (e.g. single vs ha3) reflects
+// "does each node work harder" instead of just node count. This is invariant for
+// same-node-count runs (both sides divided by the same N → identical Δ%), so it
+// never distorts the normal version-vs-version compare. Throughput/latency stay
+// as-is (cluster totals / an average are the right aggregate there).
+const CLUSTER_SRC = {
+  rss_mb_per_alpha:       {src:"rss_mb_total",     perAlpha:true},
+  jemalloc_mb_per_alpha:  {src:"jemalloc_mb_total",perAlpha:true},
+  cpu_pct_per_alpha:      {src:"cpu_pct_total",    perAlpha:true},
+  goroutines_per_alpha:   {src:"goroutines_total", perAlpha:true},
+};
+const BULK_COLS = ["nquads_per_s","records_per_s","seconds","batch_p50_ms","batch_p99_ms","retries","errors","records","nquads"];
+
+let RUNS = new Map(); // run_id -> aggregated run
+
+function mean(xs){ return xs.length ? xs.reduce((a,b)=>a+b,0)/xs.length : NaN; }
+
+// stat across a run's repeats: m is the MEDIAN (robust — one outlier repeat, e.g.
+// a lone multi-second GC/compaction stall, can't drag it, which matters for the
+// outlier-dominated tail metrics p999/max), s is the relative stddev (the spread,
+// used as the noise floor the coloring gates on). s=0 with <2 samples or zero
+// mean (can't estimate noise → gate degrades to "color everything").
+function stat(xs){
+  xs = xs.filter(v => v != null && !Number.isNaN(v)).slice().sort((a, b) => a - b);
+  const n = xs.length;
+  if (!n) return { m: NaN, s: 0 };
+  const med = n % 2 ? xs[(n - 1) / 2] : (xs[n / 2 - 1] + xs[n / 2]) / 2;
+  if (n < 2) return { m: med, s: 0 };
+  const mean = xs.reduce((a, b) => a + b, 0) / n;
+  const v = xs.reduce((a, b) => a + (b - mean) * (b - mean), 0) / (n - 1);
+  return { m: med, s: mean === 0 ? 0 : Math.sqrt(v) / Math.abs(mean) };
+}
+
+let GATED = true;    // noise-aware coloring (toggle); within-noise deltas render neutral
+const MARGIN = 1.5;  // a change must exceed noise*MARGIN (in the worse direction) to color
+
+function topoClass(e){
+  if(!e || !e.Groups) return "unknown";
+  const sharded = e.Groups > 1, ha = e.Replicas > 1;
+  return sharded && ha ? "sharded+HA" : sharded ? "sharded" : ha ? "HA" : "single";
+}
+
+// aggregate a run's repeat lines into means
+function aggregate(rid, lines){
+  const env = lines[0].env || {};
+  const clusterKeys = CLUSTER_COLS;
+  // Every compared metric is stored as a stat {m: mean, s: relStd} across repeats.
+  const nAlpha = env.NumAlphas || 1;
+  const cluster = {};
+  clusterKeys.forEach(k => {
+    const spec = CLUSTER_SRC[k] || {src:k};
+    const div = spec.perAlpha ? nAlpha : 1;
+    cluster[k] = stat(lines.map(l => { const v=(l.cluster||{})[spec.src]; return (v==null||Number.isNaN(v)) ? v : v/div; }));
+  });
+  const ops = {};
+  const opKeys = new Set();
+  lines.forEach(l => (l.ops||[]).forEach(o => opKeys.add(o.key)));
+  opKeys.forEach(key => {
+    const per = lines.map(l => (l.ops||[]).find(o=>o.key===key)).filter(Boolean);
+    const m = {};
+    OP_COLS.forEach(c => m[c] = stat(per.map(o=>o[c])));
+    ops[key] = m;
+  });
+  const bl = lines.map(l=>l.bulk_load).filter(Boolean);
+  const bulk = {};
+  if(bl.length) BULK_COLS.forEach(k => bulk[k] = stat(bl.map(b=>b[k])));
+  return {
+    id: rid, reps: lines.length, env,
+    version: env.DgraphVersion||"", branch: env.DgraphBranch||"", commit: env.DgraphCommit||"",
+    started: lines[0].started_at||"",
+    measured_seconds: stat(lines.map(l=>l.measured_seconds)),
+    scale: lines[0].scale, wc: lines[0].write_concurrency, rc: lines[0].read_concurrency,
+    cluster, ops, bulk, hasBulk: bl.length>0,
+    topo: topoClass(env),
+  };
+}
+
+function loadText(text){
+  const runs = new Map();
+  const groups = new Map();
+  let n=0;
+  text.split("\n").forEach(line=>{
+    line=line.trim(); if(!line) return;
+    let r; try { r=JSON.parse(line); } catch(e){ return; }
+    n++;
+    const id=r.run_id||"(no run_id)";
+    if(!groups.has(id)) groups.set(id,[]);
+    groups.get(id).push(r);
+  });
+  for(const [id,lines] of groups) runs.set(id, aggregate(id, lines));
+  RUNS = runs;
+  populate();
+  document.getElementById("status").textContent = `· ${runs.size} runs, ${n} lines`;
+}
+
+function fmt(v, d=2){
+  if(v==null || Number.isNaN(v)) return "—";
+  if(Math.abs(v)>=1000) return v.toLocaleString(undefined,{maximumFractionDigits:0});
+  return v.toLocaleString(undefined,{maximumFractionDigits:d});
+}
+
+// delta takes {m,s} stats (or undefined). It colors by the metric's direction,
+// but in gated mode only when the change clears the noise floor (max rel stddev
+// of the two sides × MARGIN); a within-noise change renders neutral, matching
+// `argus compare`'s gate. Ungated mode colors any non-trivial change (raw view).
+function delta(metric, sa, sb){
+  const bm = sa ? sa.m : NaN, cm = sb ? sb.m : NaN;
+  if(Number.isNaN(bm) || Number.isNaN(cm)) return {txt:"—"};
+  if(bm===0) return {txt: cm===0?"0%":"n/a"};
+  const d = (cm-bm)/bm*100;
+  const noisePct = Math.max(sa?sa.s:0, sb?sb.s:0) * 100;
+  const dr = dir(metric);
+  const thresh = GATED ? Math.max(0.05, noisePct*MARGIN) : 0.05;
+  let cls = "";
+  if(dr!==0 && Math.abs(d) > thresh){
+    const improved = dr>0 ? d>0 : d<0;
+    cls = improved ? "good" : "bad";
+  }
+  let bg = "";
+  if(cls){
+    const a = (0.12 + 0.55*Math.min(Math.abs(d)/30, 1)).toFixed(2);
+    bg = cls==="good" ? `rgba(var(--good),${a})` : `rgba(var(--bad),${a})`;
+  }
+  const within = GATED && dr!==0 && cls==="" && Math.abs(d) > 0.05; // moved, but inside noise
+  const sign = d>0?"+":"";
+  const title = `${fmt(bm)} → ${fmt(cm)}` + (noisePct>0 ? `  (noise ±${noisePct.toFixed(0)}%)` : "");
+  return { txt: `${sign}${d.toFixed(1)}%`, bg, title, within };
+}
+
+function cell(metric, sa, sb){
+  const dd = delta(metric, sa, sb);
+  const style = dd.bg ? ` style="background:${dd.bg}"` : "";
+  const title = dd.title ? ` title="${dd.title}"` : "";
+  return `<td class="${dd.within?"delta within":"delta"}"${style}${title}>${dd.txt}</td>`;
+}
+
+function metricTable(title, cols, a, b, getA, getB){
+  let rows="";
+  for(const m of cols){
+    const sa=getA(m), sb=getB(m);
+    const av=sa?sa.m:NaN, bv=sb?sb.m:NaN;
+    if(Number.isNaN(av) && Number.isNaN(bv)) continue;
+    rows += `<tr><td class="k">${m}</td><td class="base num">${fmt(av)}</td>`+
+            `<td class="cand num">${fmt(bv)}</td>${cell(m,sa,sb)}</tr>`;
+  }
+  if(!rows) return "";
+  return `<h2>${title}</h2><div class="scroll"><table>`+
+    `<tr><th class="k">metric</th><th>baseline</th><th>candidate</th><th>Δ%</th></tr>`+
+    rows+`</table></div>`;
+}
+
+function opsTable(a, b){
+  const keys = new Set([...Object.keys(a.ops), ...Object.keys(b.ops)]);
+  const sorted=[...keys].sort();
+  let head = `<tr><th class="k">op</th>`+OP_COLS.map(c=>`<th>${c.replace(/_ms$/,"").replace(/_per_s$/,"/s").replace("throughput","tput")}</th>`).join("")+`</tr>`;
+  let rows="";
+  for(const k of sorted){
+    const oa=a.ops[k]||{}, ob=b.ops[k]||{};
+    rows += `<tr><td class="k">${k}</td>`+
+      OP_COLS.map(m=>cell(m, oa[m], ob[m])).join("")+`</tr>`;
+  }
+  return `<h2>Per-op <span class="hint">— Δ% candidate vs baseline; gray = within run-to-run noise; hover for values + noise</span></h2>`+
+    `<div class="scroll"><table>${head}${rows}</table></div>`;
+}
+
+function idRow(label, av, bv){
+  const diff = String(av)!==String(bv);
+  return `<tr><td class="k">${label}</td><td class="v">${av||"—"}</td>`+
+         `<td class="v ${diff?"diffrow":""}">${bv||"—"}</td></tr>`;
+}
+
+function identityTable(a,b){
+  const rows = [
+    ["run_id", a.id, b.id],
+    ["version", a.version, b.version],
+    ["branch", a.branch, b.branch],
+    ["commit", a.commit, b.commit],
+    ["cpu_class", a.env.CPUClass, b.env.CPUClass],
+    ["cores", a.env.NumCPU, b.env.NumCPU],
+    ["ram_gb", a.env.TotalRAMGB, b.env.TotalRAMGB],
+    ["disk_class", a.env.DiskClass, b.env.DiskClass],
+    ["deploy", a.env.Deploy, b.env.Deploy],
+    ["topology", a.topo+` (g${a.env.Groups}/r${a.env.Replicas}/l${a.env.NumLearners||0})`,
+                 b.topo+` (g${b.env.Groups}/r${b.env.Replicas}/l${b.env.NumLearners||0})`],
+    ["scale", a.scale, b.scale],
+    ["write_conc", a.wc, b.wc],
+    ["repeats", a.reps, b.reps],
+    ["started", a.started, b.started],
+  ].map(r=>idRow(r[0],r[1],r[2])).join("");
+  return `<h2>Run identity</h2><div class="scroll"><table class="idtab">`+
+    `<tr><th class="k">field</th><th>baseline</th><th>candidate</th></tr>${rows}</table></div>`;
+}
+
+function warnings(a,b){
+  const w=[];
+  if(a.version===b.version && a.commit===b.commit)
+    w.push(`Both sides are the same build (${a.version||"?"}${a.commit?" @ "+a.commit:""}) — nothing to compare?`);
+  if(a.topo!==b.topo || a.env.Groups!==b.env.Groups || a.env.Replicas!==b.env.Replicas)
+    w.push(`Topology differs (${a.topo} vs ${b.topo}) — comparison may be invalid.`);
+  if(a.env.NumCPU!==b.env.NumCPU || a.env.Hostname!==b.env.Hostname)
+    w.push(`Host differs — different hardware.`);
+  if(a.wc!==b.wc || a.scale!==b.scale)
+    w.push(`Workload differs (scale/write-concurrency) — not directly comparable.`);
+  if(a.reps<3 || b.reps<3)
+    w.push(`Few repeats (${a.reps}/${b.reps}) — treat deltas as noisy; prefer ≥5.`);
+  return w.length ? `<div class="note">⚠ ${w.join("<br>⚠ ")}</div>` : "";
+}
+
+function render(){
+  const bi=document.getElementById("base").value, ci=document.getElementById("cand").value;
+  const out=document.getElementById("out"), warn=document.getElementById("warn");
+  if(!RUNS.has(bi)||!RUNS.has(ci)){ out.innerHTML=""; warn.innerHTML=""; return; }
+  const a=RUNS.get(bi), b=RUNS.get(ci);
+  warn.innerHTML = warnings(a,b);
+  let html = identityTable(a,b);
+  html += metricTable("Run summary", ["measured_seconds"], a, b, m=>a[m], m=>b[m]);
+  html += metricTable("Cluster (steady-state, median of repeats; resource metrics per alpha)", CLUSTER_COLS, a, b, m=>a.cluster[m], m=>b.cluster[m]);
+  if(a.hasBulk||b.hasBulk)
+    html += metricTable('Batch insert <span class="hint">— in-cluster live-loader-shaped mutations, not the offline <code>dgraph bulk</code></span>',
+                        BULK_COLS, a, b, m=>a.bulk[m], m=>b.bulk[m]);
+  html += opsTable(a,b);
+  out.innerHTML = html;
+}
+
+function optLabel(r){
+  return `${r.id}  ·  ${r.version}${r.commit?"@"+r.commit:""}  ·  ${r.reps} reps  ·  ${r.started.slice(0,16)}`;
+}
+function populate(){
+  const ids=[...RUNS.keys()];
+  for(const sel of [document.getElementById("base"), document.getElementById("cand")]){
+    const cur=sel.value;
+    sel.innerHTML = ids.map(id=>`<option value="${id}">${optLabel(RUNS.get(id))}</option>`).join("");
+    if(ids.includes(cur)) sel.value=cur;
+  }
+  // default: newest two, baseline=older, candidate=newest
+  if(ids.length>=2){
+    document.getElementById("base").value=ids[ids.length-2];
+    document.getElementById("cand").value=ids[ids.length-1];
+  }
+  render();
+}
+
+document.getElementById("base").addEventListener("change", render);
+document.getElementById("cand").addEventListener("change", render);
+document.getElementById("gate").addEventListener("change", (e)=>{ GATED = e.target.checked; render(); });
+document.getElementById("swap").addEventListener("click", ()=>{
+  const b=document.getElementById("base"), c=document.getElementById("cand");
+  [b.value, c.value] = [c.value, b.value]; render();
+});
+document.getElementById("file").addEventListener("change", (e)=>{
+  const f=e.target.files[0]; if(!f) return;
+  f.text().then(loadText);
+});
+
+// Auto-load the sibling runs.jsonl. Works when the folder is served over http,
+// and also from file:// in browsers that allow same-directory reads (e.g.
+// Firefox). Note: a file:// fetch returns status 0 / ok=false yet still delivers
+// the body, so we read the text regardless of r.ok rather than gating on it.
+// Chrome/Safari sandbox file:// reads entirely — those fall back to the picker.
+function autoLoad(){
+  const status = document.getElementById("status");
+  const use = (t) => { if (t && t.trim()) { loadText(t); return true; } return false; };
+  const fail = () => { status.textContent =
+    "· couldn't auto-load runs.jsonl — pick it below, or serve the folder: python3 -m http.server"; };
+
+  fetch("runs.jsonl")
+    .then(r => r.text())
+    .then(t => { if (!use(t)) throw new Error("empty"); })
+    .catch(() => {
+      // XHR fallback (some environments allow it where fetch is blocked).
+      try {
+        const x = new XMLHttpRequest();
+        x.open("GET", "runs.jsonl");
+        x.onload  = () => { if (!use(x.responseText)) fail(); };
+        x.onerror = fail;
+        x.send();
+      } catch (e) { fail(); }
+    });
+}
+autoLoad();
+</script>
+</body>
+</html>

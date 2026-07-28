@@ -29,20 +29,31 @@ type Info struct {
 	TotalRAMGB float64
 	GoVersion  string
 
-	// Operator-supplied free-form annotation (machine type, region, config, ...).
+	// Operator-supplied config dimensions that can't be auto-detected. CPUClass
+	// and DiskClass are hardware classes (e.g. "Apple M4", "e2-standard-4";
+	// "NVMe", "pd-ssd"); Deploy is the deployment mechanism (e.g. "docker-compose",
+	// "gke"). These become first-class ledger columns for sorting the run matrix.
+	CPUClass  string
+	DiskClass string
+	Deploy    string
+
+	// Operator-supplied free-form annotation for anything not covered above.
 	Labels string
 
 	// Dgraph cluster (the system under test).
-	DgraphVersion string // includes the commit hash, e.g. v25.3.4-7-g1577f25c1
-	DgraphBranch  string // operator-supplied; not exposed by the cluster API
+	DgraphVersion string // version tag from the cluster (health), e.g. v25.3.6
+	DgraphBranch  string // human branch name; operator-supplied (not on the cluster API; empty for released tag builds, which report "HEAD")
+	DgraphCommit  string // commit SHA-1; operator-supplied from `dgraph version` — the one field that uniquely pins any build, released or feature
 	ClusterGRPC   string
 	ClusterHTTP   string
 	ClusterID     string
 	Groups        int // alpha groups == shards
-	Replicas      int // members per group == replication / HA factor
-	NumAlphas     int
+	Replicas      int // voting members per group == replication / HA factor (excludes learners)
+	NumAlphas     int // total alphas across groups (voting + learners)
+	NumLearners   int // non-voting read-replica alphas (Raft learners)
 	NumZeros      int
-	Topology      string // human summary, e.g. "sharded+HA (3 groups x 3 replicas)"
+	// Topology is not stored — it's derived from the counts above via the
+	// Topology() / TopoClass() methods, so it can't drift from its source.
 }
 
 // Collect gathers host facts and queries the cluster topology from httpBase
@@ -63,15 +74,15 @@ func Collect(ctx context.Context, httpBase, grpcAddr, version, branch string) In
 		ClusterHTTP:   httpBase,
 	}
 	info.fetchTopology(ctx, httpBase)
-	info.Topology = info.topologySummary()
 	return info
 }
 
 type stateResp struct {
 	Groups map[string]struct {
 		Members map[string]struct {
-			Addr   string `json:"addr"`
-			AmDead bool   `json:"amDead"`
+			Addr    string `json:"addr"`
+			AmDead  bool   `json:"amDead"`
+			Learner bool   `json:"learner"` // non-voting read replica
 		} `json:"members"`
 	} `json:"groups"`
 	Zeros map[string]json.RawMessage `json:"zeros"`
@@ -87,9 +98,17 @@ func (i *Info) fetchTopology(ctx context.Context, httpBase string) {
 	i.Groups = len(st.Groups)
 	i.NumZeros = len(st.Zeros)
 	for _, g := range st.Groups {
-		i.NumAlphas += len(g.Members)
-		if len(g.Members) > i.Replicas {
-			i.Replicas = len(g.Members) // max members in any group == replication factor
+		voting := 0
+		for _, m := range g.Members {
+			i.NumAlphas++
+			if m.Learner {
+				i.NumLearners++
+			} else {
+				voting++
+			}
+		}
+		if voting > i.Replicas {
+			i.Replicas = voting // HA/replication factor = max VOTING members per group
 		}
 	}
 }
@@ -193,23 +212,38 @@ func shiftPort(hostPort string, delta int) string {
 	return net.JoinHostPort(host, strconv.Itoa(p+delta))
 }
 
-func (i *Info) topologySummary() string {
+// TopoClass classifies the cluster shape from the shard count (Groups) and the
+// HA factor (Replicas, voting members per group): single / HA / sharded /
+// sharded+HA. Learners are read-replicas, orthogonal to this classification, so
+// they don't change it — surface them via NumLearners / Topology().
+func (i Info) TopoClass() string {
 	if i.Groups == 0 {
 		return "unknown"
 	}
 	sharded := i.Groups > 1
 	ha := i.Replicas > 1
-	var kind string
 	switch {
 	case sharded && ha:
-		kind = "sharded+HA"
+		return "sharded+HA"
 	case sharded:
-		kind = "sharded"
+		return "sharded"
 	case ha:
-		kind = "HA"
+		return "HA"
 	default:
-		kind = "single"
+		return "single"
 	}
-	return fmt.Sprintf("%s (%d group(s) x %d replica(s); %d alphas, %d zeros)",
-		kind, i.Groups, i.Replicas, i.NumAlphas, i.NumZeros)
+}
+
+// Topology is the human summary derived from the counts, e.g.
+// "sharded+HA (3 group(s) x 3 replica(s); 9 alphas, 3 zeros, 2 learners)".
+func (i Info) Topology() string {
+	if i.Groups == 0 {
+		return "unknown"
+	}
+	s := fmt.Sprintf("%s (%d group(s) x %d replica(s); %d alphas, %d zeros",
+		i.TopoClass(), i.Groups, i.Replicas, i.NumAlphas, i.NumZeros)
+	if i.NumLearners > 0 {
+		s += fmt.Sprintf(", %d learners", i.NumLearners)
+	}
+	return s + ")"
 }

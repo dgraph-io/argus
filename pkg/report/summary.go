@@ -15,16 +15,39 @@ import (
 
 // RunSummary is the whole-run result for one measurement.
 type RunSummary struct {
-	Env             envinfo.Info        `json:"env"`
-	Mode            string              `json:"mode"` // "passes" or "duration"
-	Passes          int                 `json:"passes"`
-	Repeat          int                 `json:"repeat"`
-	Seed            int64               `json:"seed"`
-	Dataset         DatasetInfo         `json:"dataset"`
-	StartedAt       string              `json:"started_at"`
-	MeasuredSeconds float64             `json:"measured_seconds"`
-	Ops             []metrics.OpSummary `json:"ops"`
-	Cluster         ClusterSummary      `json:"cluster"`
+	RunID            string              `json:"run_id"` // shared across a run's repeats; keys the artifacts dir
+	Env              envinfo.Info        `json:"env"`
+	Mode             string              `json:"mode"` // "passes" or "duration"
+	Passes           int                 `json:"passes"`
+	Repeat           int                 `json:"repeat"`
+	Scale            float64             `json:"scale"` // dataset scale factor (0 = default/unset)
+	Seed             int64               `json:"seed"`
+	WriteConcurrency int                 `json:"write_concurrency"`
+	ReadConcurrency  int                 `json:"read_concurrency"`
+	Dataset          DatasetInfo         `json:"dataset"`
+	StartedAt        string              `json:"started_at"`
+	MeasuredSeconds  float64             `json:"measured_seconds"`
+	Ops              []metrics.OpSummary `json:"ops"`
+	Cluster          ClusterSummary      `json:"cluster"`
+	BulkLoad         *BulkLoadSummary    `json:"bulk_load,omitempty"`
+}
+
+// BulkLoadSummary captures the blind bulk-load phase: a live-loader-shaped run
+// of large, conflict-free insert batches. NQuadsPerSec is the headline number
+// (triples/s), the dimension where server-side parallel mutations should move.
+type BulkLoadSummary struct {
+	Records        int     `json:"records"`
+	NQuads         int     `json:"nquads"`
+	BatchRecords   int     `json:"batch_records"`
+	Hubs           int     `json:"hubs"` // shared @reverse target nodes (0 = scalar-only)
+	EdgesPerRecord int     `json:"edges_per_record"`
+	Seconds        float64 `json:"seconds"`
+	NQuadsPerSec   float64 `json:"nquads_per_s"`
+	RecordsPerSec  float64 `json:"records_per_s"`
+	BatchP50Ms     float64 `json:"batch_p50_ms"`
+	BatchP99Ms     float64 `json:"batch_p99_ms"`
+	Retries        int     `json:"retries"` // conflict retries during the fan-in load
+	Errors         int     `json:"errors"`
 }
 
 // DatasetInfo records the corpus sizes, so a comparison can refuse runs whose
@@ -45,12 +68,19 @@ type DatasetInfo struct {
 type ClusterSummary struct {
 	Nodes           int     `json:"nodes"`
 	RSSMBTotal      float64 `json:"rss_mb_total"`
+	JemallocMBTotal float64 `json:"jemalloc_mb_total"` // off-heap (jemalloc); part of RSS the Go heap profile can't see
 	CPUPercentTotal float64 `json:"cpu_pct_total"`
 	GoroutinesTotal float64 `json:"goroutines_total"`
 	QueriesPerSec   float64 `json:"queries_per_s"`
 	CommitsPerSec   float64 `json:"commits_per_s"`
 	AbortsPerSec    float64 `json:"aborts_per_s"`
 	ServerAvgMs     float64 `json:"server_avg_ms"`
+	// WriteBalanceCV is the coefficient of variation (stddev/mean) of per-alpha
+	// mean active-mutations at steady state: ~0 = writes evenly spread across
+	// alphas, high = concentrated on few. Only meaningful for sharded configs
+	// (for HA, writes go to the group leader, so a high CV is expected, not a
+	// problem). 0 when fewer than 2 alphas.
+	WriteBalanceCV float64 `json:"write_balance_cv"`
 }
 
 // WriteJSON writes a summary to path.

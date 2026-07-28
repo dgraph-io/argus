@@ -1,0 +1,4 @@
+# Per-run pprof profiles + interval CSVs are heavy and ephemeral; the ledger
+# (runs.jsonl) is the durable record. Commit a run's artifacts explicitly (git add -f)
+# only when an investigation is worth keeping.
+artifacts/

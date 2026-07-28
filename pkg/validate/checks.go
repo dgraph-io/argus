@@ -39,12 +39,14 @@ type Checker struct {
 	gql          *graphql.Client
 	data         testdata.Dataset
 	vectorStrict bool
+	expectBulk   bool // the bulk-load phase ran, so its records must validate
 }
 
 // NewChecker creates a checker for the given dataset. vectorStrict additionally
 // asserts exact similar_to nearest-neighbor recall (a regression gate).
-func NewChecker(dgraph *cluster.DgraphClient, gql *graphql.Client, data testdata.Dataset, vectorStrict bool) *Checker {
-	return &Checker{dgraph: dgraph, gql: gql, data: data, vectorStrict: vectorStrict}
+// expectBulk asserts the blind bulk-load corpus is present and correct.
+func NewChecker(dgraph *cluster.DgraphClient, gql *graphql.Client, data testdata.Dataset, vectorStrict, expectBulk bool) *Checker {
+	return &Checker{dgraph: dgraph, gql: gql, data: data, vectorStrict: vectorStrict, expectBulk: expectBulk}
 }
 
 // CheckAll runs every check and returns the aggregate result.
@@ -65,6 +67,9 @@ func (c *Checker) CheckAll(ctx context.Context) *Result {
 	c.checkAllPosts(ctx, add)
 	c.checkAllCategories(ctx, add)
 	c.checkAllProducts(ctx, add)
+	if c.expectBulk {
+		c.checkAllBulkRecords(ctx, add)
+	}
 
 	// Functional correctness of index-backed queries.
 	c.checkGeo(ctx, add)
@@ -650,6 +655,89 @@ func (c *Checker) checkAllPosts(ctx context.Context, add func(string, bool, stri
 		}
 	}
 	m.emit("dql-posts-complete", add)
+}
+
+type bulkNode struct {
+	Brid     string  `json:"brid"`
+	Name     string  `json:"brname"`
+	Num      int     `json:"brnum"`
+	Score    float64 `json:"brscore"`
+	Text     string  `json:"brtext"`
+	Flag     bool    `json:"brflag"`
+	HubCount int     `json:"bc"` // count(brhub)
+}
+
+// checkAllBulkRecords completely verifies the blind bulk-load corpus: every
+// generated record is present with exact field values and the right number of
+// brhub edges, no record is missing, and no extra record leaked. When the
+// fan-in variant is active it also checks the hub pool size and the global
+// reverse-edge total. Keyed by brid, so it holds regardless of batch grouping.
+func (c *Checker) checkAllBulkRecords(ctx context.Context, add func(string, bool, string)) {
+	actual := map[string]bulkNode{}
+	total := 0
+	if err := c.fetchAllDQL(ctx, "BulkRecord", `brid brname brnum brscore brtext brflag bc: count(brhub)`, func(raw json.RawMessage) error {
+		var n bulkNode
+		if err := json.Unmarshal(raw, &n); err != nil {
+			return err
+		}
+		actual[n.Brid] = n
+		total++
+		return nil
+	}); err != nil {
+		add("dql-bulkload-complete", false, err.Error())
+		return
+	}
+
+	m := &cmp{}
+	wantReverse := 0
+	expected := make(map[string]bool, c.data.NumBulkRecords)
+	for i := 0; i < c.data.NumBulkRecords; i++ {
+		w := c.data.BulkRecord(i)
+		wantEdges := len(c.data.BulkHubIndices(i))
+		wantReverse += wantEdges
+		expected[w.Brid] = true
+		g, ok := actual[w.Brid]
+		if !ok {
+			m.missing++
+			m.ex("missing " + w.Brid)
+			continue
+		}
+		switch {
+		case g.Name != w.Name || g.Num != w.Num || !floatEq(g.Score, w.Score) || g.Text != w.Text || g.Flag != w.Flag:
+			m.mismatch++
+			m.ex(w.Brid)
+		case g.HubCount != wantEdges:
+			m.mismatch++
+			m.ex(fmt.Sprintf("%s: %d brhub edges, want %d", w.Brid, g.HubCount, wantEdges))
+		default:
+			m.verified++
+		}
+	}
+	for brid := range actual {
+		if !expected[brid] {
+			m.extra++
+			m.ex("extra " + brid)
+		}
+	}
+	// A duplicated brid (e.g. a re-fired blind batch) inflates the row count
+	// without showing as "extra"; catch it explicitly.
+	if total != len(actual) {
+		m.ex(fmt.Sprintf("%d rows but %d distinct brids (duplicates)", total, len(actual)))
+		m.mismatch++
+	}
+	m.emit("dql-bulkload-complete", add)
+
+	// Fan-in variant: the hub pool and the global reverse-edge total must match.
+	if c.data.BulkHubs > 0 && c.data.BulkEdges > 0 {
+		c.countCheck(ctx, add, "dql-bulkhub-count",
+			`{ q(func: type(BulkHub)) { c: count(uid) } }`, c.data.BulkHubs)
+		gotRev, err := c.countQuery(ctx, `{ var(func: type(BulkRecord)) { n as count(brhub) } q() { c: sum(val(n)) } }`)
+		if err != nil {
+			add("dql-bulkload-reverse-total", false, err.Error())
+		} else {
+			add("dql-bulkload-reverse-total", gotRev == wantReverse, fmt.Sprintf("want %d got %d", wantReverse, gotRev))
+		}
+	}
 }
 
 // fetchAllDQL pages through every node of a type, invoking fn with each node's

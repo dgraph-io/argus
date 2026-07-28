@@ -14,15 +14,16 @@ import (
 
 // Op classifies an operation for aggregation. Key() combines type and label.
 const (
-	OpDQLWrite  = "dql-write"
-	OpDQLDelete = "dql-delete"
-	OpDQLQuery  = "dql-query"
-	OpGQLWrite  = "gql-write"
-	OpGQLDelete = "gql-delete"
-	OpGQLQuery  = "gql-query"
-	OpDQLLedger = "dql-ledger"
-	OpGQLLedger = "gql-ledger"
-	OpGQLSub    = "gql-sub"
+	OpDQLWrite    = "dql-write"
+	OpDQLDelete   = "dql-delete"
+	OpDQLQuery    = "dql-query"
+	OpGQLWrite    = "gql-write"
+	OpGQLDelete   = "gql-delete"
+	OpGQLQuery    = "gql-query"
+	OpDQLLedger   = "dql-ledger"
+	OpGQLLedger   = "gql-ledger"
+	OpGQLSub      = "gql-sub"
+	OpDQLBulkLoad = "dql-bulkload"
 )
 
 type window struct {

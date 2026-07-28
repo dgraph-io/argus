@@ -62,6 +62,29 @@ type Comment {
   comment_post
 }
 
+# BulkRecord backs the blind bulk-load phase (mirrors the live loader: large
+# batches of fresh inserts, no upsert query block, no conflicts). brid is
+# @index(exact) but deliberately NOT @upsert, so inserts stay blind; the load
+# runs once per run on a clean slate, so each brid lands exactly once. The mix
+# of index kinds gives server-side parallel mutations real index-apply work.
+type BulkRecord {
+  brid
+  brname
+  brnum
+  brscore
+  brtext
+  brflag
+  brhub
+}
+
+# BulkHub is the shared target pool for the bulk-load reverse-edge fan-in: each
+# record links to a few hubs via brhub, so every insert mutation also maintains
+# many @reverse posting lists. That edge + reverse-index apply work is what
+# server-side parallel mutations fan out across cores (the live-loader shape).
+type BulkHub {
+  bhid
+}
+
 xid: string @index(exact) @upsert .
 name: string @index(exact, term, fulltext) @lang .
 email: string @index(hash, trigram) @upsert .
@@ -89,6 +112,14 @@ posts: [uid] @reverse .
 text: string @index(fulltext) .
 comment_author: uid @reverse .
 comment_post: uid @reverse .
+brid: string @index(exact) .
+brname: string @index(term) .
+brnum: int @index(int) .
+brscore: float @index(float) .
+brtext: string @index(fulltext) .
+brflag: bool @index(bool) .
+brhub: [uid] @reverse @count .
+bhid: string @index(exact) .
 `
 }
 

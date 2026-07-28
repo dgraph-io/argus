@@ -1,0 +1,98 @@
+# envsubst template for the in-cluster argus Job. Render + apply with:
+#
+#   envsubst < argus-job.tmpl.yaml | kubectl -n "$NAMESPACE" apply -f -
+#
+# (deploy/k8s/benchmark.sh in dgraph-experimental does this for you.) Only the
+# ${VARS} below are substituted; the container's $(DGRAPH_ALPHA) downward-ref is
+# left untouched by envsubst.
+#
+# Running in-cluster is required for correct multi-alpha metrics: argus discovers
+# every alpha from the seed's /state and reaches each pod directly (per-pod DNS /
+# pod IP), which only resolves inside the cluster. Pointing argus at an external
+# LoadBalancer VIP instead would scramble per-node scraping (each request hits a
+# random alpha).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600 # keep the pod ~1h so results can be copied out
+  template:
+    metadata:
+      labels:
+        app: argus
+    spec:
+      restartPolicy: Never
+      # Keep the load generator off the Dgraph nodes so it never steals CPU from
+      # the system under test (gke-provision.sh labels the argus/system pool).
+      nodeSelector:
+        workload: argus
+      containers:
+        - name: argus
+          image: ${ARGUS_IMAGE}
+          # Always re-pull: the image is commonly re-pushed under the same tag while
+          # iterating, and IfNotPresent would silently run a stale cached layer.
+          imagePullPolicy: Always
+          args:
+            - -cluster=$(DGRAPH_ALPHA):9080 # seed gRPC (DQL)
+            - -graphql=http://$(DGRAPH_ALPHA):8080 # seed HTTP (GraphQL); /state discovery finds the rest
+            - -passes=${PASSES}
+            - -repeats=${REPEATS}
+            - -scale=${SCALE}
+            - -write-concurrency=${WRITE_CONC}
+            # Sharded configs only: spread predicates across groups after schema so
+            # writes distribute (no-op for <2 groups). SHARD_BALANCE=false elsewhere.
+            - -shard-balance=${SHARD_BALANCE}
+            - -zero=${ZERO_URL}
+            # Consolidated results store: one JSONL line per repeat, copied out and
+            # appended to the committed baselines ledger by the orchestrator.
+            - -ledger=/out/runs.jsonl
+            - -run-id=${RUN_ID}
+            - -cpu-class=${CPU_CLASS}
+            - -disk-class=${DISK_CLASS}
+            - -deploy=${DEPLOY}
+            - -label=${LABEL}
+            # From `kubectl exec <alpha-pod> -- dgraph version` (branch is "HEAD" for
+            # released tag builds — blank then; the commit SHA pins the build).
+            - -dgraph-branch=${DGRAPH_BRANCH}
+            - -dgraph-commit=${DGRAPH_COMMIT}
+            - -summary-output= # skip the standalone JSON; the ledger is the record
+            - -ops-output=/out/argus-ops.csv
+            - -runtime-output=/out/argus-runtime.csv
+            - -cluster-output=/out/argus-cluster.csv
+          env:
+            - name: DGRAPH_ALPHA
+              value: ${ALPHA_SVC} # alpha Service; used only as the discovery seed
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          volumeMounts:
+            - name: out
+              mountPath: /out
+        # Sidecar: keeps the pod alive after the argus container exits so the
+        # orchestrator can copy /out. `kubectl cp` execs `tar` inside a container,
+        # which is impossible once the pod has completed — hence a live sidecar
+        # sharing the volume. benchmark.sh deletes the Job once results are copied;
+        # the 1h sleep is a self-cleanup bound if the orchestrator dies first.
+        - name: sink
+          image: busybox:1.36
+          command: ["sh", "-c", "sleep 3600"]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: 16Mi
+            limits:
+              cpu: "100m"
+              memory: 64Mi
+          volumeMounts:
+            - name: out
+              mountPath: /out
+      volumes:
+        - name: out
+          emptyDir: {}

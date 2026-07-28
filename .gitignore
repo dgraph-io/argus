@@ -1,2 +1,11 @@
 /bin/
 /tmp/
+
+# Ephemeral per-run artifacts (pprof profiles + per-interval CSVs). The durable
+# record is results/runs.jsonl; commit an individual run's artifacts explicitly
+# (git add -f) only when you want to keep them.
+/results/artifacts/
+
+# macOS
+.DS_Store
+**/.DS_Store

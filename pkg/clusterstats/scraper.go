@@ -30,6 +30,7 @@ const (
 	mCPU        = "process_cpu_seconds_total"
 	mGoroutines = "go_goroutines"
 	mHeapInuse  = "go_memstats_heap_inuse_bytes"
+	mJemalloc   = "dgraph_memory_alloc_bytes" // off-heap bytes allocated via jemalloc (z.Calloc)
 	mQueries    = "dgraph_num_queries_total"
 	mCommits    = "dgraph_txn_commits_total"
 	mAborts     = "dgraph_txn_aborts_total"
@@ -41,7 +42,7 @@ const (
 )
 
 var wantMetrics = map[string]bool{
-	mRSS: true, mCPU: true, mGoroutines: true, mHeapInuse: true,
+	mRSS: true, mCPU: true, mGoroutines: true, mHeapInuse: true, mJemalloc: true,
 	mQueries: true, mCommits: true, mAborts: true, mPending: true,
 	mActiveMut: true, mLeader: true, mLatSum: true, mLatCount: true,
 }
@@ -52,6 +53,7 @@ type NodeSample struct {
 	Leader          bool
 	RSSMB           float64
 	HeapInuseMB     float64
+	JemallocMB      float64 // off-heap (jemalloc); RSS ≈ HeapInuse + Jemalloc + other
 	Goroutines      float64
 	CPUPercent      float64 // cores-worth: 100 == one core fully busy
 	QueriesPerSec   float64
@@ -122,6 +124,7 @@ func (s *Scraper) scrapeOne(ctx context.Context, ep envinfo.Endpoint) (NodeSampl
 		Leader:          cur[mLeader] > 0,
 		RSSMB:           cur[mRSS] / mb,
 		HeapInuseMB:     cur[mHeapInuse] / mb,
+		JemallocMB:      cur[mJemalloc] / mb,
 		Goroutines:      cur[mGoroutines],
 		PendingQueries:  cur[mPending],
 		ActiveMutations: cur[mActiveMut],
@@ -160,6 +163,7 @@ func Aggregate(samples []NodeSample) NodeSample {
 	for _, s := range samples {
 		agg.RSSMB += s.RSSMB
 		agg.HeapInuseMB += s.HeapInuseMB
+		agg.JemallocMB += s.JemallocMB
 		agg.Goroutines += s.Goroutines
 		agg.CPUPercent += s.CPUPercent
 		agg.QueriesPerSec += s.QueriesPerSec

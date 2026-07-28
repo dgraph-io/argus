@@ -110,6 +110,9 @@ type Dataset struct {
 	ReviewsPerProduct int
 	NumDogs           int // Animal-interface members
 	NumCats           int
+	NumBulkRecords    int // blind bulk-load corpus (live-loader-shaped insert)
+	BulkHubs          int // shared @reverse target pool for the bulk-load fan-in (0 = scalar-only)
+	BulkEdges         int // brhub edges per bulk record (0 = scalar-only)
 }
 
 // DefaultDataset returns a corpus sized so a full write pass completes well
@@ -127,6 +130,9 @@ func DefaultDataset() Dataset {
 		ReviewsPerProduct: 3,
 		NumDogs:           60,
 		NumCats:           40,
+		NumBulkRecords:    20000,
+		BulkHubs:          5000, // ~records/4 => modest fan-in (~16 reverse edges/hub)
+		BulkEdges:         4,
 	}
 }
 
@@ -155,8 +161,23 @@ func ScaledDataset(s float64) Dataset {
 	d.NumEphProducts = n(d.NumEphProducts)
 	d.NumDogs = n(d.NumDogs)
 	d.NumCats = n(d.NumCats)
+	d.NumBulkRecords = n(d.NumBulkRecords)
+	// Hubs track the record count so fan-in (reverse edges per hub) stays constant
+	// across scales; edges-per-record is a fixed shape, left unscaled.
+	d.BulkHubs = BulkHubCount(d.NumBulkRecords)
 	// ReviewsPerProduct is a per-product multiplier; left unscaled.
 	return d
+}
+
+// BulkHubCount returns the shared-hub-pool size for a given record count: about
+// a quarter of the records, so each hub sees ~BulkEdges*4 reverse edges — many
+// modest @reverse lists (the live-loader shape) rather than a few giant ones.
+func BulkHubCount(records int) int {
+	h := records / 4
+	if h < 1 {
+		h = 1
+	}
+	return h
 }
 
 // SmallDataset returns a tiny corpus for smoke tests and quick determinism
@@ -174,6 +195,9 @@ func SmallDataset() Dataset {
 		ReviewsPerProduct: 2,
 		NumDogs:           12,
 		NumCats:           8,
+		NumBulkRecords:    500,
+		BulkHubs:          125,
+		BulkEdges:         4,
 	}
 }
 
@@ -218,6 +242,64 @@ func (d Dataset) Person(i int) Person {
 	}
 	return p
 }
+
+// BulkRecord is a deterministic record for the blind bulk-load phase. It has no
+// edges: links would need blank-node refs scoped to one mutation, coupling
+// correctness to the batch grouping. Pure indexed scalars instead give parallel
+// mutations a spread of index-apply work (exact/term/int/float/fulltext/bool)
+// while keeping validation a clean field-by-field compare keyed by brid.
+type BulkRecord struct {
+	Brid  string
+	Name  string
+	Num   int
+	Score float64
+	Text  string
+	Flag  bool
+}
+
+// BulkRecord returns the bulk-load record at index i, derived purely from i.
+func (d Dataset) BulkRecord(i int) BulkRecord {
+	r := det(2_000_000 + i)
+	return BulkRecord{
+		Brid:  fmt.Sprintf("bulk-%d", i),
+		Name:  firstNames[r.Intn(len(firstNames))],
+		Num:   r.Intn(1_000_000),
+		Score: float64(r.Intn(1_000_000)) / 100.0,
+		Text:  bios[r.Intn(len(bios))],
+		Flag:  r.Intn(2) == 0,
+	}
+}
+
+// BulkHubIndices returns the hub indices record i links to: BulkEdges hubs
+// spaced H/E apart starting at i, so the targets are distinct and consecutive
+// records map to neighboring hubs. That index-locality keeps concurrent batches
+// (consecutive record ranges) on mostly-disjoint hubs, so the fan-in stays
+// conflict-light while every mutation still touches many @reverse lists. Returns
+// nil when the dataset is scalar-only.
+func (d Dataset) BulkHubIndices(i int) []int {
+	if d.BulkHubs <= 0 || d.BulkEdges <= 0 {
+		return nil
+	}
+	stride := d.BulkHubs / d.BulkEdges
+	if stride < 1 {
+		stride = 1
+	}
+	out := make([]int, 0, d.BulkEdges)
+	seen := make(map[int]struct{}, d.BulkEdges)
+	for j := 0; j < d.BulkEdges; j++ {
+		h := (i + j*stride) % d.BulkHubs
+		if _, dup := seen[h]; dup {
+			continue // tiny hub pools can collide; keep edges distinct
+		}
+		seen[h] = struct{}{}
+		out = append(out, h)
+	}
+	return out
+}
+
+// BulkHubXid is the stable external id of hub h (for debugging; the load itself
+// references hubs by their server-assigned uid captured at create time).
+func BulkHubXid(h int) string { return fmt.Sprintf("bulkhub-%d", h) }
 
 // friendOffsets define the deterministic out-edges of the friends graph: a +1
 // ring connects everyone, and a +7 shortcut keeps shortest paths non-trivial.

@@ -1,0 +1,47 @@
+# Build a candidate Dgraph image natively on linux/amd64 (jemalloc enabled) and
+# push it to Artifact Registry. build-candidate.sh stages the build context:
+# the dgraph working tree at /workspace/dgraph (with .git, so the binary is
+# git-stamped) and, when folding, sibling badger/ristretto at /workspace/{badger,
+# ristretto} with go.mod replaces already applied.
+#
+# Native amd64 is the whole point: dgraph's contrib/Dockerfile.build does
+# `COPY . .` and can't see sibling modules, so folding local badger/ristretto
+# only works on a host build. Cloud Build's amd64 VM is that host.
+#
+# Substitutions (set by build-candidate.sh):
+#   _IMAGE           full AR ref, REGION-docker.pkg.dev/PROJECT/REPO/dgraph:TAG
+#   _GO_VERSION      Go toolchain (default 1.26 — matches dgraph's Makefile)
+#   _DGRAPH_VERSION  stamped BUILD_VERSION / image tag codename (default: cand)
+substitutions:
+  _GO_VERSION: "1.26"
+  _DGRAPH_VERSION: "cand"
+options:
+  machineType: E2_HIGHCPU_8
+timeout: 3600s
+steps:
+  # 1. Compile natively (CGO + jemalloc). `make dgraph` builds jemalloc as a
+  #    prerequisite and stamps gitBranch/lastCommitSHA/version from /workspace/dgraph.
+  - id: build-binary
+    name: golang:${_GO_VERSION}
+    dir: dgraph
+    env:
+      - GOOS=linux
+      - GOARCH=amd64
+      - CGO_ENABLED=1
+    script: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      git config --global --add safe.directory /workspace/dgraph
+      make dgraph DGRAPH_VERSION="${_DGRAPH_VERSION}"
+      mkdir -p linux
+      cp ./dgraph/dgraph ./linux/dgraph
+      echo "==> candidate identity:"
+      ./linux/dgraph version || true
+  # 2. Package the runtime image (contrib/Dockerfile does `ADD linux /usr/local/bin`)
+  #    and push (Cloud Build pushes everything under `images:`).
+  - id: image
+    name: gcr.io/cloud-builders/docker
+    dir: dgraph
+    args: ["build", "-f", "contrib/Dockerfile", "-t", "${_IMAGE}", "."]
+images:
+  - ${_IMAGE}
