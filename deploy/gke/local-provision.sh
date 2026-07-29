@@ -206,8 +206,21 @@ else
       ;;
   esac
 
-  # Optional image overrides
-  [[ -n "$IMAGE_REPOSITORY" ]] && SVC_FLAGS+=(--set image.repository="$IMAGE_REPOSITORY")
+  # Optional image overrides. The chart builds the ref as
+  # `printf "%s/%s:%s" image.registry image.repository image.tag`, so a
+  # fully-qualified repository (e.g. an Artifact Registry path
+  # `us-central1-docker.pkg.dev/proj/repo/dgraph`) would get `docker.io/`
+  # prepended. Detect a registry host in the first path segment (contains a
+  # `.` or `:`) and split it into image.registry; a bare repo like
+  # `dgraph/dgraph` leaves registry at the chart default (docker.io).
+  if [[ -n "$IMAGE_REPOSITORY" ]]; then
+    first="${IMAGE_REPOSITORY%%/*}"
+    if [[ "$first" == *.* || "$first" == *:* ]]; then
+      SVC_FLAGS+=(--set image.registry="$first" --set image.repository="${IMAGE_REPOSITORY#*/}")
+    else
+      SVC_FLAGS+=(--set image.repository="$IMAGE_REPOSITORY")
+    fi
+  fi
   [[ -n "$IMAGE_TAG" ]] && SVC_FLAGS+=(--set image.tag="$IMAGE_TAG")
 
   # Topology: replicaCount (total alphas) x shardReplicaCount (voting replicas/group).

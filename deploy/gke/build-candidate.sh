@@ -78,7 +78,18 @@ IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/dgraph:${TAG}"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 log "==> staging build context in $STAGE"
-rsync -a --delete --exclude='/linux/' "$DGRAPH/" "$STAGE/dgraph/"
+# Trim build junk from the upload. `make dgraph` runs `go mod tidy` first, which
+# walks EVERY package's imports (test files included), so the test-package *source*
+# (dgraphtest, systest/1million/common, ...) must stay or tidy falls back to the
+# proxy and resolves the ancient v1 module. Only their bulky *data* is excludable:
+# dgraphtest/datafiles is ~24 GiB of local test-run artifacts and dgraphtest/binaries
+# ~266 MiB of cached dgraph builds — neither is in any import graph. .git stays (the
+# build git-stamps the binary).
+rsync -a --delete \
+  --exclude='/linux/' \
+  --exclude='/dgraphtest/datafiles/' --exclude='/dgraphtest/binaries/' \
+  --exclude='*.test' --exclude='*.out' \
+  "$DGRAPH/" "$STAGE/dgraph/"
 
 FOLDED=()
 fold() { # <module-path> <src-dir> <dest-name>

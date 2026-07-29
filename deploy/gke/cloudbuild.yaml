@@ -28,11 +28,17 @@ steps:
       - GOOS=linux
       - GOARCH=amd64
       - CGO_ENABLED=1
+      # Cloud Build substitutes ${_VARS} in env: (but NOT in script:), so expose
+      # _DGRAPH_VERSION as a plain env var the script can read.
+      - DGRAPH_VERSION=${_DGRAPH_VERSION}
     script: |
       #!/usr/bin/env bash
       set -euo pipefail
+      # `make dgraph` compiles jemalloc from a .tar.bz2; the golang image has the
+      # cgo toolchain (gcc/g++/make) but not bzip2 for the extraction.
+      apt-get update -qq && apt-get install -y -qq --no-install-recommends bzip2
       git config --global --add safe.directory /workspace/dgraph
-      make dgraph DGRAPH_VERSION="${_DGRAPH_VERSION}"
+      make dgraph DGRAPH_VERSION="$DGRAPH_VERSION"
       mkdir -p linux
       cp ./dgraph/dgraph ./linux/dgraph
       echo "==> candidate identity:"
