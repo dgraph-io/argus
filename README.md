@@ -310,6 +310,102 @@ For the laptop docker-compose tier, see
 [results/README.md](results/README.md) and [deploy/README.md](deploy/README.md)
 (image build + the in-cluster Job manifest).
 
+## Recipes
+
+Task-oriented walkthroughs for the things you actually do day to day. All GKE
+commands run from `deploy/gke/`.
+
+### Benchmark a candidate build against a stored baseline
+
+The core loop: Cloud Build the Dgraph working tree, run it under a baseline's
+topology, and diff. The image tag is derived from the tree's git SHA
+(`cand-<sha>`, `-dirty` if uncommitted), so whatever is checked out gets tested.
+
+```bash
+./benchmark.sh candidate \
+  --dgraph ~/code/dgraph \
+  --config ha3 \
+  --baseline-run 20260727-125528 \
+  -z us-east1-c \
+  -m n2-standard-8 --alpha-cpu 6 --alpha-mem 24Gi
+```
+
+`--baseline-run` selects the left side of the diff from the ledger — a `run_id`
+prefix (the timestamp is usually unique) or a `k=v` filter like
+`version=v25.3.8,config=ha3`. The candidate's `--config` must match the
+baseline's topology, or the compare is meaningless.
+
+### Reuse a running cluster vs. provision a fresh one
+
+`--zones "a b c"` probes several zones for capacity and picks one — use it for a
+**cold start** when you don't know where there's room. If a cluster already
+exists, point straight at its zone with `-z <zone>` and provisioning is skipped:
+the zone/pool are reused and only the Helm release is torn down and reinstalled
+(PVCs reset, clean data). `-z` defaults to `us-central1-a`, so set it explicitly
+when your cluster lives elsewhere, or a new cluster spins up in the default zone.
+
+### Read a compare verdict
+
+`argus compare` gates on the run-to-run noise floor, not raw deltas, and labels
+each row so a faster run doesn't read as a regression:
+
+- **`tail-only (avg ok)`** — p99 moved but the average didn't; a tail blip, non-gating.
+- **`load-shift (run faster)`** — the whole run got faster and this op's latency
+  rose no more than the speedup warrants; non-gating (per-op throughput is
+  `count / shared-window`, so a faster run lifts every op's latency in step).
+- **`low-confidence (thin sample)`** — the move is sub-millisecond or rests on
+  too few samples to trust; non-gating.
+- **`REGRESSION`** — cleared threshold *and* noise, and none of the above explain
+  it. Only these gate the verdict (non-zero exit).
+
+The `cluster`/`workload`/`bulkload` block (RSS, jemalloc, CPU, goroutines,
+wall-clock) always prints — that's your memory/leak safety panel. `-all` adds
+every per-op row. Note cluster figures are 3-alpha totals; per-alpha RSS lives in
+the run's `argus-cluster-N.csv` artifact.
+
+### Diff two runs by hand
+
+```bash
+bin/argus ls      -ledger results/gke/runs.jsonl                 # list recorded runs
+bin/argus compare -ledger results/gke/runs.jsonl \
+  -baseline-run 20260727-125528 -candidate-run 20260729-100917
+```
+
+`-ledger` matters: the default is the laptop ledger (`results/runs.jsonl`), so
+GKE runs need `-ledger results/gke/runs.jsonl` or you'll get "no run matches".
+Tunable gates: `-noise-margin`, `-load-factor`, `-min-latency-ms`, `-min-samples`.
+
+### Isolate the build-pipeline confound
+
+A candidate is a source build (Cloud Build, jemalloc-from-source); a released
+baseline is an official image. That difference — Go version, optimizer flags,
+jemalloc tuning — rides along in every delta, and it cuts against the candidate.
+To measure only the *code* delta, build both sides through the same pipeline:
+
+```bash
+git -C ~/code/dgraph worktree add /tmp/dg-v2538 v25.3.8
+./benchmark.sh candidate --dgraph /tmp/dg-v2538 --config ha3 -z us-east1-c \
+  -m n2-standard-8 --alpha-cpu 6 --alpha-mem 24Gi   # records a same-pipeline baseline
+# then compare your real candidate against that run instead of the release baseline
+```
+
+### Find and clean up leftover GKE resources
+
+Teardown is easy to forget, and a running cluster bills ~$1/hr. Audit, then tear
+down (disks included):
+
+```bash
+gcloud container clusters list --project dgraph-dev-sandbox
+gcloud compute instances list  --project dgraph-dev-sandbox
+gcloud compute disks list      --project dgraph-dev-sandbox   # orphaned PVs bill too
+
+./gke-provision.sh teardown -p dgraph-dev-sandbox -z us-east1-c -C dgraph-bench
+```
+
+`teardown` deletes the PVs by default (`--keep-disks` to retain); it also reclaims
+disks when the cluster is already gone, so a half-finished teardown can be
+re-run to mop up orphans.
+
 ## Local development
 
 Start a single-node cluster, then run the smoke test:
