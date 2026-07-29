@@ -25,6 +25,9 @@ func runCompare(args []string) {
 	throughput := fs.Float64("throughput", report.DefaultThresholds.Throughput, "Throughput regression threshold (fraction)")
 	resource := fs.Float64("resource", report.DefaultThresholds.Resource, "Cluster resource (RAM/CPU/heap) regression threshold (fraction)")
 	noiseMargin := fs.Float64("noise-margin", report.DefaultThresholds.NoiseMargin, "Worsening must exceed run-to-run noise by this factor to count (dampens jittery p99 tails)")
+	loadFactor := fs.Float64("load-factor", report.DefaultThresholds.LoadFactor, "When the whole run is faster, a per-op latency rise up to this multiple of the speedup is load-shift, not a regression (0 disables)")
+	minLatencyMs := fs.Float64("min-latency-ms", report.DefaultThresholds.MinLatencyDeltaMs, "A latency regression must move at least this many ms absolute to gate (0 disables)")
+	minSamples := fs.Int("min-samples", report.DefaultThresholds.MinSamples, "A latency regression must rest on at least this many completed ops to gate (0 disables)")
 	baseHeap := fs.String("baseline-heap", "", "Baseline heap pprof file (default: auto-discover heap-{startup,end}.pb.gz in the run's artifacts dir)")
 	candHeap := fs.String("candidate-heap", "", "Candidate heap pprof file (paired with -baseline-heap)")
 	heapTop := fs.Int("heap-top", 12, "Number of allocation sites to show per heap phase")
@@ -79,6 +82,7 @@ func runCompare(args []string) {
 
 	rep := report.Compare(base, cand, report.Thresholds{
 		Latency: *latency, Throughput: *throughput, Resource: *resource, NoiseMargin: *noiseMargin,
+		LoadFactor: *loadFactor, MinLatencyDeltaMs: *minLatencyMs, MinSamples: *minSamples,
 	})
 	addHeapDiffs(rep, baseDir, candDir, *baseHeap, *candHeap, *resource, *heapTop)
 	addCPUDiff(rep, baseDir, candDir, *baseCPU, *candCPU, *cpuTop)

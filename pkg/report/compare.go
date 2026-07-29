@@ -20,10 +20,31 @@ type Thresholds struct {
 	// repeat (HDR-bucketed), so a delta that merely edges past noise is jitter;
 	// requiring, say, 1.5x separates signal from that. <=0 falls back to 1.
 	NoiseMargin float64
+	// LoadFactor: when the whole run finished faster (measured wall-clock down
+	// beyond noise), a per-op latency regression no larger than this multiple of
+	// the global speedup is demoted to a non-gating "load-shift" — it tracks the
+	// run shifting rather than a localized slowdown. Every op's throughput is
+	// count/shared-window, so a faster run lifts all op rates uniformly and drags
+	// per-op latencies with it; only a latency increase that dwarfs the speedup is
+	// a real per-op regression. <=0 disables the demotion.
+	LoadFactor float64
+	// MinLatencyDeltaMs: a per-op latency regression must move at least this many
+	// milliseconds in absolute terms to gate. A sub-millisecond move on a cheap op
+	// (e.g. schema introspection) clears a relative threshold easily but is below
+	// timing resolution and scheduler jitter. <=0 disables the floor.
+	MinLatencyDeltaMs float64
+	// MinSamples: a per-op latency regression must rest on at least this many
+	// completed ops (candidate side) to gate. A mean drawn from a handful of
+	// samples is jitter, not signal. Skipped when the count is unknown (0).
+	// <=0 disables the floor.
+	MinSamples int
 }
 
 // DefaultThresholds is a reasonable starting gate.
-var DefaultThresholds = Thresholds{Latency: 0.10, Throughput: 0.10, Resource: 0.15, NoiseMargin: 1.5}
+var DefaultThresholds = Thresholds{
+	Latency: 0.10, Throughput: 0.10, Resource: 0.15, NoiseMargin: 1.5,
+	LoadFactor: 2, MinLatencyDeltaMs: 1.0, MinSamples: 100,
+}
 
 // stat is a mean and relative standard deviation across repeats.
 type stat struct {
@@ -67,6 +88,15 @@ type Finding struct {
 	// tail moved but the mean did not, which is usually noise or a narrow tail
 	// blip rather than a systemic slowdown. Shown, but does not gate the verdict.
 	TailOnly bool
+	// LoadShifted marks a per-op latency regression demoted because the whole run
+	// finished faster and this op's latency rose no more than LoadFactor× that
+	// speedup — the increase tracks the faster run, not a localized slowdown.
+	// Shown, but does not gate the verdict.
+	LoadShifted bool
+	// LowConfidence marks a per-op latency regression demoted because it rests on
+	// too few samples or too small an absolute move to trust. Shown, but does not
+	// gate the verdict.
+	LowConfidence bool
 }
 
 // Report is the full comparison outcome.
@@ -78,6 +108,11 @@ type Report struct {
 	Contention  []*ContentionDiff
 	Regressed   bool
 	noiseMargin float64 // factor by which worsening must exceed noise (see Thresholds)
+	// globalSpeedup is the fraction the whole run got faster (measured wall-clock),
+	// positive = faster; set only when it clears the noise margin. Drives the
+	// load-shift demotion and the rendered note.
+	globalSpeedup float64
+	loadFactor    float64 // multiple of globalSpeedup below which a latency rise is load-shift
 }
 
 // AddCPU attaches a CPU-profile comparison. It is diagnostic only — CPU totals
@@ -133,6 +168,7 @@ func Compare(baseline, candidate []*RunSummary, th Thresholds) *Report {
 	if r.noiseMargin <= 0 {
 		r.noiseMargin = 1
 	}
+	r.loadFactor = th.LoadFactor
 	r.Warnings = envWarnings(baseline, candidate)
 
 	// Union of op keys present on both sides.
@@ -159,6 +195,21 @@ func Compare(baseline, candidate []*RunSummary, th Thresholds) *Report {
 		r.add(key, "avg", collect(baseline, key, avgOf), collect(candidate, key, avgOf), th.Latency, true)
 	}
 
+	// Whole-run wall-clock: the headline aggregate. Higher is worse, and it gates
+	// like any other finding — a globally slower candidate flags here even if no
+	// single op stands out. It also sets the global-speedup context the load-shift
+	// demotion uses below.
+	msBase := runVals(baseline, func(r *RunSummary) float64 { return r.MeasuredSeconds })
+	msCand := runVals(candidate, func(r *RunSummary) float64 { return r.MeasuredSeconds })
+	r.add("workload", "measured_s", msBase, msCand, th.Latency, true)
+	if b, c := meanStat(msBase), meanStat(msCand); b.mean > 0 && c.mean > 0 {
+		speedup := (b.mean - c.mean) / b.mean // positive = candidate faster
+		noise := math.Max(b.relStd, c.relStd)
+		if speedup > 0 && speedup > noise*r.noiseMargin {
+			r.globalSpeedup = speedup
+		}
+	}
+
 	// Cluster steady-state resource.
 	r.add("cluster", "rss_mb_total", clusterVals(baseline, func(c ClusterSummary) float64 { return c.RSSMBTotal }),
 		clusterVals(candidate, func(c ClusterSummary) float64 { return c.RSSMBTotal }), th.Resource, true)
@@ -166,6 +217,10 @@ func Compare(baseline, candidate []*RunSummary, th Thresholds) *Report {
 		clusterVals(candidate, func(c ClusterSummary) float64 { return c.JemallocMBTotal }), th.Resource, true)
 	r.add("cluster", "cpu_pct_total", clusterVals(baseline, func(c ClusterSummary) float64 { return c.CPUPercentTotal }),
 		clusterVals(candidate, func(c ClusterSummary) float64 { return c.CPUPercentTotal }), th.Resource, true)
+	// Goroutines gated like memory: a steady-state count that climbs across
+	// otherwise-similar runs is a leak signal RSS alone can lag behind.
+	r.add("cluster", "goroutines_total", clusterVals(baseline, func(c ClusterSummary) float64 { return c.GoroutinesTotal }),
+		clusterVals(candidate, func(c ClusterSummary) float64 { return c.GoroutinesTotal }), th.Resource, true)
 	r.add("cluster", "queries_per_s", clusterVals(baseline, func(c ClusterSummary) float64 { return c.QueriesPerSec }),
 		clusterVals(candidate, func(c ClusterSummary) float64 { return c.QueriesPerSec }), th.Throughput, false)
 
@@ -176,6 +231,8 @@ func Compare(baseline, candidate []*RunSummary, th Thresholds) *Report {
 	r.add("bulkload", "batch_p99", bulkVals(baseline, func(b *BulkLoadSummary) float64 { return b.BatchP99Ms }),
 		bulkVals(candidate, func(b *BulkLoadSummary) float64 { return b.BatchP99Ms }), th.Latency, true)
 
+	r.demoteLoadShifted(th.LoadFactor)
+	r.dampenLowConfidence(th.MinLatencyDeltaMs, th.MinSamples, candCounts(candidate))
 	r.corroborateLatency()
 
 	for _, f := range r.Findings {
@@ -185,6 +242,52 @@ func Compare(baseline, candidate []*RunSummary, th Thresholds) *Report {
 		}
 	}
 	return r
+}
+
+// demoteLoadShifted demotes a per-op latency regression (p99 or avg) to a
+// non-gating "load-shift" when the whole run finished faster (globalSpeedup set)
+// and the latency rose no more than loadFactor× that speedup. Per-op throughput
+// is count/shared-window, so a faster run lifts every op's rate uniformly and
+// drags its latencies up in step; an increase within loadFactor× the speedup is
+// that shift, not a localized slowdown. A latency increase that dwarfs the
+// speedup is left as a regression. Runs before corroborateLatency so a demoted
+// avg lets its p99 fall through to tail-only. No-op unless the run is globally
+// faster, so a flat-or-slower candidate gates latency normally.
+func (r *Report) demoteLoadShifted(loadFactor float64) {
+	if loadFactor <= 0 || r.globalSpeedup <= 0 {
+		return
+	}
+	ceiling := loadFactor * r.globalSpeedup * 100 // DeltaPct is in percent
+	for i := range r.Findings {
+		f := &r.Findings[i]
+		if !f.Regression || (f.Metric != "p99" && f.Metric != "avg") {
+			continue
+		}
+		if f.DeltaPct > 0 && f.DeltaPct <= ceiling {
+			f.Regression = false
+			f.LoadShifted = true
+		}
+	}
+}
+
+// dampenLowConfidence demotes a per-op latency regression to a non-gating
+// "low-confidence" when the evidence is too thin to trust: the absolute move is
+// below minMs (sub-millisecond jitter on a cheap op) or the candidate op ran
+// fewer than minSamples times (a mean from a handful of samples). Runs before
+// corroborateLatency so a demoted avg lets its p99 fall through to tail-only.
+func (r *Report) dampenLowConfidence(minMs float64, minSamples int, count map[string]float64) {
+	for i := range r.Findings {
+		f := &r.Findings[i]
+		if !f.Regression || (f.Metric != "p99" && f.Metric != "avg") {
+			continue
+		}
+		subMs := minMs > 0 && math.Abs(f.Candidate-f.Baseline) < minMs
+		lowN := minSamples > 0 && count[f.Op] > 0 && count[f.Op] < float64(minSamples)
+		if subMs || lowN {
+			f.Regression = false
+			f.LowConfidence = true
+		}
+	}
 }
 
 // corroborateLatency demotes a per-op p99 regression to tail-only when the same
@@ -247,13 +350,22 @@ func (r *Report) Render(onlyRegressions bool) string {
 	fmt.Fprintf(&b, "%-34s %-14s %12s %12s %9s %8s %8s  %s\n",
 		"op", "metric", "baseline", "candidate", "delta%", "thr%", "noise%", "verdict")
 	for _, f := range r.Findings {
-		if onlyRegressions && !f.Regression && !f.TailOnly {
+		// The aggregate resource/throughput block (cluster RSS/jemalloc/CPU/
+		// goroutines, whole-run wall-clock, bulk-load) is always shown — it's the
+		// safety panel you check to confirm nothing regressed, so hiding a healthy
+		// row would defeat the purpose. Only per-op rows collapse to regressions.
+		if onlyRegressions && !isAggregate(f.Op) &&
+			!f.Regression && !f.TailOnly && !f.LoadShifted && !f.LowConfidence {
 			continue
 		}
 		verdict := "ok"
 		switch {
 		case f.Regression:
 			verdict = "REGRESSION"
+		case f.LoadShifted:
+			verdict = "load-shift (run faster)"
+		case f.LowConfidence:
+			verdict = "low-confidence (thin sample)"
 		case f.TailOnly:
 			verdict = "tail-only (avg ok)"
 		}
@@ -272,6 +384,10 @@ func (r *Report) Render(onlyRegressions bool) string {
 	for _, d := range r.Contention {
 		b.WriteString(d.Render())
 		b.WriteString("\n")
+	}
+	if r.globalSpeedup > 0 {
+		fmt.Fprintf(&b, "NOTE: whole run %.1f%% faster (wall-clock); a per-op latency rise up to %.1f%% (%.0f× the speedup) tracks that and is marked load-shift, not a regression.\n",
+			r.globalSpeedup*100, r.loadFactor*r.globalSpeedup*100, r.loadFactor)
 	}
 	if r.Regressed {
 		b.WriteString("VERDICT: REGRESSION DETECTED\n")
@@ -293,6 +409,39 @@ func collect(runs []*RunSummary, key string, f func(*metrics.OpSummary) float64)
 		if o := r.op(key); o != nil {
 			out = append(out, f(o))
 		}
+	}
+	return out
+}
+
+// candCounts is the median per-op completion count across the candidate repeats,
+// keyed by op — the sample size behind each op's latency mean.
+func candCounts(runs []*RunSummary) map[string]float64 {
+	byOp := map[string][]float64{}
+	for _, r := range runs {
+		for i := range r.Ops {
+			o := &r.Ops[i]
+			byOp[o.Key] = append(byOp[o.Key], float64(o.Count))
+		}
+	}
+	out := make(map[string]float64, len(byOp))
+	for k, xs := range byOp {
+		sort.Float64s(xs)
+		out[k] = xs[len(xs)/2]
+	}
+	return out
+}
+
+// isAggregate reports whether an op key is a whole-run aggregate (resource,
+// wall-clock, bulk-load) rather than a per-op workload row. These always render.
+func isAggregate(op string) bool {
+	return op == "cluster" || op == "workload" || op == "bulkload"
+}
+
+// runVals collects a per-run scalar across the repeats.
+func runVals(runs []*RunSummary, f func(*RunSummary) float64) []float64 {
+	out := make([]float64, 0, len(runs))
+	for _, r := range runs {
+		out = append(out, f(r))
 	}
 	return out
 }
