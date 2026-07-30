@@ -315,6 +315,23 @@ For the laptop docker-compose tier, see
 Task-oriented walkthroughs for the things you actually do day to day. All GKE
 commands run from `deploy/gke/`.
 
+### Record baselines for a new release
+
+When a version ships, capture the canonical baselines across topologies in one
+command. `baseline-release.sh` sweeps `single`/`ha3`/`shard3`/`ha5` on a single
+reused cluster (the Dgraph pool resizes per topology, ascending so it only grows),
+tolerates a config failing, and tears the cluster down on success:
+
+```bash
+./baseline-release.sh v25.4.0
+# subset / keep the cluster: --configs "single ha3 shard3" --keep-cluster
+```
+
+Each config records its repeats to `results/gke/runs.jsonl`; commit them so future
+candidates have a stored baseline to diff against. Don't start a sweep while a
+candidate run is live — it reuses the same cluster and release, and its reset
+would evict the in-flight run.
+
 ### Benchmark a candidate build against a stored baseline
 
 The core loop: Cloud Build the Dgraph working tree, run it under a baseline's
