@@ -30,7 +30,7 @@ Options:
                        "us-central1-c us-east1-b us-west1-b". Dodges GCE stockouts:
                        the first zone with capacity (or an existing cluster of this
                        name) is used, overriding -z.
-  -C, --cluster        GKE cluster name (default: dgraph-cluster)
+  -C, --cluster        GKE cluster name (default: dgraph-bench)
   -m, --machine-type   Dgraph pool machine type (default: n2-standard-8)
   -N, --num-nodes      Dgraph pool node count (default: 3; must fit the topology)
       --argus-machine-type  argus/system pool machine type (default: e2-standard-4)
@@ -42,6 +42,7 @@ Options:
       --alpha-mem      Alpha memory requests==limits, e.g. 26Gi
       --zero-cpu       Zero CPU requests==limits (default 1)
       --zero-mem       Zero memory requests==limits (default 2Gi)
+      --ready-timeout  Max seconds to wait for Dgraph pods to be ready (default 900)
       --image-repository  Override Dgraph image repository (e.g. dgraph/dgraph)
       --image-tag         Override Dgraph image tag (e.g. v25.3.7)
       --reset          Delete PVCs before (re)deploying Dgraph
@@ -82,7 +83,7 @@ USAGE
 PROJECT=""
 ZONE="us-central1-a"
 ZONES=""
-CLUSTER_NAME="dgraph-cluster"
+CLUSTER_NAME="dgraph-bench"
 MACHINE_TYPE="n2-standard-8"
 ARGUS_MACHINE_TYPE="e2-standard-4"
 DISK_TYPE="pd-ssd"
@@ -94,6 +95,7 @@ ALPHA_EXTRA_FLAGS=""
 CHART_VERSION=""
 ZERO_CPU=""
 ZERO_MEM=""
+READY_TIMEOUT=""
 NS="dgraph"
 REL="dgraph"
 CFG=""
@@ -160,6 +162,7 @@ while [[ $# -gt 0 ]]; do
     --chart-version) CHART_VERSION="${2:?missing value for $1}"; shift 2;;
     --zero-cpu) ZERO_CPU="${2:?missing value for $1}"; shift 2;;
     --zero-mem) ZERO_MEM="${2:?missing value for $1}"; shift 2;;
+    --ready-timeout) READY_TIMEOUT="${2:?missing value for $1}"; shift 2;;
     -c|--config) CFG="${2:?missing value for $1}"; shift 2;;
     -n|--namespace) NS="${2:?missing value for $1}"; shift 2;;
     -r|--release) REL="${2:?missing value for $1}"; shift 2;;
@@ -405,6 +408,7 @@ EOF
   [[ -n "$CHART_VERSION" ]] && CONFIG_ARGS+=(--chart-version "$CHART_VERSION")
   [[ -n "$ZERO_CPU" ]] && CONFIG_ARGS+=(--zero-cpu "$ZERO_CPU")
   [[ -n "$ZERO_MEM" ]] && CONFIG_ARGS+=(--zero-mem "$ZERO_MEM")
+  [[ -n "$READY_TIMEOUT" ]] && CONFIG_ARGS+=(--ready-timeout "$READY_TIMEOUT")
   [[ -n "$SHELL_SYNTAX" ]] && CONFIG_ARGS+=(--shell "$SHELL_SYNTAX")
   $EMIT_ENV && CONFIG_ARGS+=(--emit-env)
 
@@ -414,10 +418,11 @@ EOF
 delete_orphaned_disks() {
   log "Searching for orphaned disks in zone '$ZONE'..."
 
-  # Find disks that were created by GKE PVCs (they have goog-gke-volume prefix or pvc- in name)
+  # Find disks that were created by GKE PVCs (they have goog-gke-volume prefix or pvc- in name).
+  # Only unattached ones: a live cluster's node boot disks also match '^gke-'.
   DISKS=$(gcloud compute disks list \
     --project="$PROJECT" \
-    --filter="zone:$ZONE AND (name~'^gke-' OR name~'^pvc-')" \
+    --filter="zone:$ZONE AND (name~'^gke-' OR name~'^pvc-') AND -users:*" \
     --format="value(name)" 2>/dev/null || true)
 
   if [[ -z "$DISKS" ]]; then
@@ -460,6 +465,12 @@ teardown_cluster() {
 
   if ! gcloud container clusters describe "$CLUSTER_NAME" --zone "$ZONE" --project "$PROJECT" &>/dev/null; then
     log "Cluster '$CLUSTER_NAME' does not exist."
+    local others
+    others="$(gcloud container clusters list --zone "$ZONE" --project "$PROJECT" --format="value(name)" 2>/dev/null || true)"
+    if [[ -n "$others" ]]; then
+      log "Clusters in zone '$ZONE': $(echo $others)"
+      log "  Pass -C <name> to tear one of them down."
+    fi
     # The cluster may have been deleted already while its PVs orphaned — clean those
     # up regardless (deleting a GKE cluster does NOT reclaim dynamically-provisioned
     # pd-ssd PVs, so they keep billing). Skip only with --keep-disks.

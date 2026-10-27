@@ -38,6 +38,9 @@ Options:
       --zero-cpu        Zero CPU requests==limits (default 1)
       --zero-mem        Zero memory requests==limits (default 2Gi)
       --reset          Delete PVCs for this release before (re)deploying
+      --ready-timeout   Max seconds to wait for Dgraph pods to be ready (default 900).
+                        Fails sooner on conditions that never clear on their own
+                        (disk quota, image pull, crash loop, 5m+ unschedulable).
       --lb-source-range CIDR to restrict LB traffic (e.g. 1.2.3.4/32) (gke only)
       --emit-env       Print export lines for DGRAPH_* vars (for eval)
       --shell          Shell syntax for --emit-env: bash|fish (default: bash)
@@ -78,7 +81,9 @@ ALPHA_MEM=""
 ZERO_CPU="1"
 ZERO_MEM="2Gi"
 ALPHA_EXTRA_FLAGS=""
-CHART_VERSION="24.1.4"   # pinned so a stale local cache can't silently change the deploy
+READY_TIMEOUT="900"
+UNSCHEDULABLE_GRACE="300"  # seconds a pod may sit Unschedulable (autoscaler headroom)
+CHART_VERSION="24.1.4"  # pinned so a stale local cache can't silently change the deploy
 # argus runs in-cluster and calls the whitelist-guarded /admin,/health,/debug,/state
 # endpoints, so the alpha must allow the pod's source IP. GKE pod/node IPs live in
 # 10.0.0.0/8; the other private ranges cover local (Docker Desktop / kind) clusters.
@@ -87,6 +92,104 @@ WHITELIST="--security whitelist=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 
 # Logging helper (keep stdout clean if using --emit-env)
 log() { echo "$@" >&2; }
+
+# One snapshot of the release's pods/PVCs/events. Prints a readiness summary line,
+# then (exit 0) a second line naming a stuck condition that won't clear on its own,
+# or exits 1 if the rollout may still progress.
+check_stuck() {
+  local snap="$CHART_TMP/state.json"
+  kubectl -n "$NS" get pods,pvc,events -o json > "$snap" 2>/dev/null || return 1
+  python3 - "$snap" "$REL" "$UNSCHEDULABLE_GRACE" <<'PY'
+import json, re, sys
+from collections import Counter
+from datetime import datetime, timezone
+
+rel, grace = sys.argv[2], int(sys.argv[3])
+items = json.load(open(sys.argv[1]))["items"]
+mine = lambda o: o["metadata"].get("labels", {}).get("release") == rel
+pods = [o for o in items if o["kind"] == "Pod" and mine(o)]
+pending_pvcs = {o["metadata"]["uid"]: o["metadata"]["name"] for o in items
+                if o["kind"] == "PersistentVolumeClaim" and mine(o)
+                and o.get("status", {}).get("phase") == "Pending"}
+now = datetime.now(timezone.utc)
+age = lambda ts: (now - datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds()
+
+total, ready = Counter(), Counter()
+for p in pods:
+    comp = p["metadata"]["labels"].get("component", "?")
+    total[comp] += 1
+    ready[comp] += any(c["type"] == "Ready" and c["status"] == "True"
+                       for c in p.get("status", {}).get("conditions", []))
+print(", ".join(f"{c} {ready[c]}/{total[c]}" for c in sorted(total)) + " ready")
+
+def stuck(obj, why):
+    print(f"{obj}: {why}")
+    sys.exit(0)
+
+# Quota exhaustion: the CSI provisioner retries forever, and nothing frees quota.
+for e in items:
+    if e["kind"] != "Event" or e["involvedObject"].get("uid") not in pending_pvcs:
+        continue
+    m = re.search(r"Quota '[^']+' exceeded\.\s+Limit: \S+ in region [\w-]+", e.get("message", ""))
+    if e.get("reason") == "ProvisioningFailed" and m:
+        stuck(f"pvc/{pending_pvcs[e['involvedObject']['uid']]}", m.group(0))
+
+for p in pods:
+    name, st = f"pod/{p['metadata']['name']}", p.get("status", {})
+    for c in st.get("initContainerStatuses", []) + st.get("containerStatuses", []):
+        w = c.get("state", {}).get("waiting") or {}
+        r = w.get("reason", "")
+        if r in ("ImagePullBackOff", "InvalidImageName", "CreateContainerConfigError"):
+            stuck(name, f"{r}: {w.get('message', '')}")
+        if r == "CrashLoopBackOff" and c.get("restartCount", 0) >= 3:
+            t = c.get("lastState", {}).get("terminated", {})
+            stuck(name, f"CrashLoopBackOff after {c['restartCount']} restarts "
+                        f"(last exit {t.get('exitCode')} {t.get('reason', '')})")
+    # Grace period lets the cluster autoscaler add a node before we give up.
+    for cond in st.get("conditions", []):
+        if (cond["type"] == "PodScheduled" and cond["status"] == "False"
+                and cond.get("reason") == "Unschedulable"
+                and age(cond["lastTransitionTime"]) >= grace):
+            stuck(name, f"unschedulable for {grace}s+: {cond.get('message', '')}")
+sys.exit(1)
+PY
+}
+
+fail_ready() {
+  log ""
+  log "ERROR: Dgraph pods are stuck: $1"
+  log ""
+  kubectl -n "$NS" get pods,pvc -l release="$REL" -o wide 1>&2 || true
+  log ""
+  log "Recent warning events:"
+  kubectl -n "$NS" get events --field-selector type=Warning --sort-by=.lastTimestamp 2>/dev/null | tail -n 10 1>&2 || true
+  exit 1
+}
+
+# Replaces an unbounded `kubectl rollout status`, which waits forever on pods that
+# can never start (e.g. PVCs blocked by a GCE disk quota).
+wait_ready() {
+  local deadline=$((SECONDS + READY_TIMEOUT)) out last=""
+  log "Waiting for Dgraph pods to be ready (timeout ${READY_TIMEOUT}s)..."
+  while :; do
+    if kubectl -n "$NS" rollout status "statefulset/${REL}-dgraph-zero" --timeout=1s >/dev/null 2>&1 &&
+       kubectl -n "$NS" rollout status "statefulset/${REL}-dgraph-alpha" --timeout=1s >/dev/null 2>&1; then
+      log "All Dgraph pods ready."
+      return
+    fi
+    if out="$(check_stuck)"; then
+      fail_ready "${out#*$'\n'}"
+    fi
+    if [[ -n "$out" && "${out%%$'\n'*}" != "$last" ]]; then
+      last="${out%%$'\n'*}"
+      log "  $last"
+    fi
+    if (( SECONDS >= deadline )); then
+      fail_ready "not ready after ${READY_TIMEOUT}s (raise --ready-timeout if pods are still progressing)"
+    fi
+    sleep 10
+  done
+}
 
 # Parse args (supports short + long)
 while [[ $# -gt 0 ]]; do
@@ -105,6 +208,7 @@ while [[ $# -gt 0 ]]; do
     --chart-version) CHART_VERSION="${2:?missing value for $1}"; shift 2;;
     --zero-cpu) ZERO_CPU="${2:?missing value for $1}"; shift 2;;
     --zero-mem) ZERO_MEM="${2:?missing value for $1}"; shift 2;;
+    --ready-timeout) READY_TIMEOUT="${2:?missing value for $1}"; shift 2;;
     --shell) SHELL_SYNTAX="${2:?missing value for $1}"; shift 2;;
     --emit-env) EMIT_ENV=true; shift;;
     -h|--help) usage; exit 0;;
@@ -276,8 +380,7 @@ PY
   log "Deploying: cfg=$CFG (alphas=$ALPHA_REPLICAS, replicas/group=$SHARD_REPLICAS) chart=$CHART_VERSION expose=$EXPOSE ns=$NS release=$REL${IMAGE_REPOSITORY:+ image=$IMAGE_REPOSITORY}${IMAGE_TAG:+:$IMAGE_TAG}${ALPHA_EXTRA_FLAGS:+ extra-flags=[$ALPHA_EXTRA_FLAGS]}"
   helm upgrade --install "$REL" "$CHART_PATH" -n "$NS" -f "$VALUES_FILE" -f "$OVERLAY" "${SVC_FLAGS[@]}" 1>&2
 
-  kubectl -n "$NS" rollout status "statefulset/${REL}-dgraph-zero" 1>&2
-  kubectl -n "$NS" rollout status "statefulset/${REL}-dgraph-alpha" 1>&2
+  wait_ready
 fi
 
 # Determine endpoints and export env vars (but note: exports won't persist unless sourced/eval'd)
