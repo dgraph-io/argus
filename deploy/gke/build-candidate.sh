@@ -43,7 +43,7 @@ log() { echo "$@" >&2; }
 die() { log "ERROR: $*"; exit 1; }
 
 PROJECT="" DGRAPH="" BADGER="" RISTRETTO=""
-REGION="us-central1" REPO="argus" TAG="" GO_VERSION="1.26"
+REGION="us-central1" REPO="argus" TAG="" GO_VERSION="1.27"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
