@@ -11,7 +11,8 @@
       "Bash(/Users/matthew/code/argus/bin/argus -small -duration 12s -flush-interval 3s -write-concurrency 8 -read-concurrency 6 -ops-output /tmp/argus-ops.csv -runtime-output /tmp/argus-runtime.csv)",
       "Bash(/Users/matthew/code/argus/bin/argus -small -duration 12s -flush-interval 3s -ops-output /tmp/run1-ops.csv -runtime-output /tmp/run1-runtime.csv)",
       "Bash(echo \"EXIT: $?\")",
-      "Bash(/Users/matthew/code/argus/bin/argus -small -duration 12s -flush-interval 3s -ops-output /tmp/run2-ops.csv -runtime-output /tmp/run2-runtime.csv)"
+      "Bash(/Users/matthew/code/argus/bin/argus -small -duration 12s -flush-interval 3s -ops-output /tmp/run2-ops.csv -runtime-output /tmp/run2-runtime.csv)",
+      "Bash(./bin/argus compare *)"
     ],
     "additionalDirectories": [
       "/Users/matthew/code/dgo/protos"
